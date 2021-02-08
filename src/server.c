@@ -111,6 +111,7 @@ static size_t malloc_top_pad;
 /*#define unsetenv(name)                SetEnvironmentVariable((name),NULL)*/
 #define setenv(name,value,overwrite)  _putenv_s((name), strdup(value))
 #define unsetenv(name)                _putenv_s((name), "")
+void fdevent_win32_init (volatile sig_atomic_t *ptr);
 #endif
 
 static int oneshot_fd = 0;
@@ -2134,6 +2135,10 @@ static int main_init_once (void) {
     setlocale(LC_TIME, "C");
     tzset();
 
+  #ifdef _WIN32
+    fdevent_win32_init(&handle_sig_child);
+  #endif
+
     return 1;
 }
 
@@ -2181,6 +2186,9 @@ int main (int argc, char ** argv) {
         chunkqueue_internal_pipes(0);
         remove_pid_file(srv);
         config_log_error_close(srv);
+      #ifdef _WIN32
+        fdevent_win32_cleanup();
+      #endif
         if (graceful_restart)
             server_sockets_save(srv);
         else
