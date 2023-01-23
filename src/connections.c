@@ -811,8 +811,7 @@ __attribute_cold__
 static int connection_read_cq_err(connection *con) {
     request_st * const r = &con->request;
   #ifdef _WIN32
-    int lastError = WSAGetLastError();
-    switch (lastError) {
+    switch (WSAGetLastError()) {
       case WSAEWOULDBLOCK:
         return 0;
       case WSAEINTR:
@@ -823,8 +822,8 @@ static int connection_read_cq_err(connection *con) {
         /* suppress logging for this error, expected for keep-alive */
         break;
     default:
-        log_error(r->conf.errh, __FILE__, __LINE__,
-          "connection closed - recv failed: %d", lastError);
+        log_serror(r->conf.errh, __FILE__, __LINE__,
+          "connection closed - recv failed");
         break;
     }
   #else
