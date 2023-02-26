@@ -292,8 +292,13 @@ static void lighttpd_ServiceCtrlDispatcher (int argc, char ** argv)
 #include <signal.h>     /* sig_atomic_t */
 void fdevent_win32_init (volatile sig_atomic_t *ptr);
 
+#ifdef BUILD_LIBRARY
+int lighttpd_main (int argc, char ** argv, void(*callback)());
+#   define main(a,b) lighttpd_win_main(a, b, void(*callback)())
+#elif
 __attribute_cold__
 int lighttpd_main (int argc, char ** argv);
+#endif
 
 #include <fcntl.h>      /* _O_BINARY */
 #include <io.h>         /* _setmode() */
@@ -325,7 +330,11 @@ int main (int argc, char ** argv)
 
     fdevent_win32_init(&handle_sig_child);
 
+    #ifdef BUILD_LIBRARY
+    rc = lighttpd_main(argc, argv, callback);
+    #else
     rc = lighttpd_main(argc, argv);
+    #endif
 
     fdevent_win32_init(NULL);
 

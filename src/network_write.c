@@ -15,9 +15,10 @@
 
 
 /* on linux 2.4.x you get either sendfile or LFS */
+#ifndef HAVE_SENDFILE_BROKEN
 #if defined HAVE_SYS_SENDFILE_H && defined HAVE_SENDFILE \
  && (!defined _LARGEFILE_SOURCE || defined HAVE_SENDFILE64) \
- && defined(__linux__) && !defined HAVE_SENDFILE_BROKEN
+ && defined(__linux__)
 # ifdef NETWORK_WRITE_USE_SENDFILE
 #  error "can't have more than one sendfile implementation"
 # endif
@@ -69,6 +70,7 @@
 # define NETWORK_WRITE_USE_AIX_SENDFILE
 #endif
 */
+#endif /* HAVE_SENDFILE_BROKEN */
 
 #if defined HAVE_SYS_UIO_H && defined HAVE_WRITEV
 # define NETWORK_WRITE_USE_WRITEV

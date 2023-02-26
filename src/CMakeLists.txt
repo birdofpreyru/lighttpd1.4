@@ -15,6 +15,9 @@ add_definitions(-D_TIME_BITS=64 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LA
 # default to ON
 set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "Default value for ``POSITION_INDEPENDENT_CODE`` of targets.")
 
+option(BUILD_LIBRARY "build as library instead of executable [default: off]")
+option(WITH_ANDROID_NDK_SYSLOG_INTERCEPT "with logs re-routing to Android NDK functions [default: off]")
+option(WITH_JAVA_NATIVE_INTERFACE "build as JNI library [default: off]")
 option(WITH_XATTR "with xattr-support for the stat-cache [default: off]")
 option(WITH_MYSQL "with mysql-support for mod_vhostdb_mysql [default: off]")
 option(WITH_PGSQL "with postgres-support for mod_vhostdb_pgsql [default: off]")
@@ -46,6 +49,10 @@ option(WITH_LIBUNWIND "with libunwind to print backtraces in asserts [default: o
 option(WITH_MAXMINDDB "with MaxMind GeoIP2-support mod_maxminddb [default: off]")
 option(WITH_SASL "with SASL-support for mod_authn_sasl [default: off]")
 option(WITH_XXHASH "with system-provided xxhash [default: off]")
+
+if(WITH_JAVA_NATIVE_INTERFACE)
+	set(BUILD_LIBRARY 1)
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
 	option(BUILD_EXTRA_WARNINGS "extra warnings")
@@ -221,6 +228,10 @@ check_include_files(sys/filio.h HAVE_SYS_FILIO_H)
 check_function_exists(port_create HAVE_PORT_CREATE)
 check_function_exists(sendfilev HAVE_SENDFILEV)
 check_function_exists(setpflags HAVE_SETPFLAGS)
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "iOS")
+	set(HAVE_SENDFILE_BROKEN 1)
 endif()
 
 check_type_size(long SIZEOF_LONG)
@@ -889,11 +900,27 @@ endif()
 
 if(CMAKE_CROSSCOMPILING)
 	# custom compile lemon using native compiler
+	if(CMAKE_SYSTEM_NAME MATCHES "iOS")
+		execute_process(
+			COMMAND xcrun --sdk macosx --show-sdk-path
+			OUTPUT_VARIABLE MACOSX_SDK_PATH
+		)
+		string(REPLACE "\n" "" MACOSX_SDK_PATH ${MACOSX_SDK_PATH})
+		set(LEMON_BUILD_FLAGS
+			--target=${CMAKE_HOST_SYSTEM_PROCESSOR}-apple-macosx
+			-isysroot ${MACOSX_SDK_PATH}
+			-I ${MACOSX_SDK_PATH}/usr/include
+			-L ${MACOSX_SDK_PATH}/usr/lib
+		)
+	endif()
 	add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lemon
 		COMMAND cc
 		ARGS    ${CMAKE_CURRENT_SOURCE_DIR}/lemon.c -o ${CMAKE_CURRENT_BINARY_DIR}/lemon
+						${LEMON_BUILD_FLAGS}
 		DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lemon.c
 		COMMENT "Generating lemon from lemon.c using native compiler"
+		VERBATIM
+		COMMAND_EXPAND_LISTS
 	)
 else()
 	add_executable(lemon lemon.c)
@@ -927,15 +954,22 @@ set(SERVER_SRC
 	configparser.c
 )
 
-if(WIN32 AND NOT BUILD_STATIC)
-set(COMMON_SRC ${COMMON_SRC} mod_auth_api.c mod_vhostdb_api.c)
-add_executable(lighttpd ${SERVER_SRC} ${COMMON_SRC} ${BUILTIN_MODS})
-SET_TARGET_PROPERTIES(lighttpd PROPERTIES ENABLE_EXPORTS ON)
-SET_TARGET_PROPERTIES(lighttpd PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+if(BUILD_LIBRARY)
+	add_library(lighttpd ${SERVER_SRC} ${COMMON_SRC} ${BUILTIN_MODS})
+	if (WITH_ANDROID_NDK_SYSLOG_INTERCEPT)
+		target_link_libraries(lighttpd log)
+	endif()
 else()
-add_executable(lighttpd ${SERVER_SRC} ${COMMON_SRC} ${BUILTIN_MODS})
+  if(WIN32 AND NOT BUILD_STATIC)
+  set(COMMON_SRC ${COMMON_SRC} mod_auth_api.c mod_vhostdb_api.c)
+  add_executable(lighttpd ${SERVER_SRC} ${COMMON_SRC} ${BUILTIN_MODS})
+  SET_TARGET_PROPERTIES(lighttpd PROPERTIES ENABLE_EXPORTS ON)
+  SET_TARGET_PROPERTIES(lighttpd PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+  else()
+  add_executable(lighttpd ${SERVER_SRC} ${COMMON_SRC} ${BUILTIN_MODS})
+  endif()
+  set(L_INSTALL_TARGETS ${L_INSTALL_TARGETS} lighttpd)
 endif()
-set(L_INSTALL_TARGETS ${L_INSTALL_TARGETS} lighttpd)
 
 add_and_install_library(mod_accesslog mod_accesslog.c)
 add_and_install_library(mod_ajp13 mod_ajp13.c)
@@ -949,10 +983,12 @@ add_and_install_library(mod_cgi mod_cgi.c)
 add_and_install_library(mod_deflate mod_deflate.c)
 add_and_install_library(mod_dirlisting mod_dirlisting.c)
 add_and_install_library(mod_extforward mod_extforward.c)
+add_and_install_library(mod_indexfile mod_indexfile.c)
 add_and_install_library(mod_proxy mod_proxy.c)
 add_and_install_library(mod_rrdtool mod_rrdtool.c)
 add_and_install_library(mod_sockproxy mod_sockproxy.c)
 add_and_install_library(mod_ssi mod_ssi.c)
+add_and_install_library(mod_staticfile mod_staticfile.c)
 add_and_install_library(mod_status mod_status.c)
 add_and_install_library(mod_userdir mod_userdir.c)
 if(WIN32 AND NOT BUILD_STATIC)

@@ -185,6 +185,7 @@
 #cmakedefine  HAVE_PWRITEV
 #cmakedefine  HAVE_SELECT
 #cmakedefine  HAVE_SENDFILE
+#cmakedefine  HAVE_SENDFILE_BROKEN
 #cmakedefine  HAVE_SEND_FILE
 #cmakedefine  HAVE_SENDFILE64
 #cmakedefine  HAVE_SENDFILEV
@@ -211,4 +212,7 @@
 /* libunwind */
 #cmakedefine HAVE_LIBUNWIND
 
+#cmakedefine BUILD_LIBRARY
 #cmakedefine LIGHTTPD_STATIC
+#cmakedefine WITH_ANDROID_NDK_SYSLOG_INTERCEPT
+#cmakedefine WITH_JAVA_NATIVE_INTERFACE

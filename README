@@ -3,6 +3,10 @@
 lighttpd
 ========
 
+NOTE: This fork of the original Lighttpd is modified by Dr. Sergey Pogodin
+<doc@pogodin.studio> (https://dr.pogodin.studio) to support its building as
+a library Android / iOS / Windows devices.
+
 -------------
 a light httpd
 -------------

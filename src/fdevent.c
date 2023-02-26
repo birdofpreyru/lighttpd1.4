@@ -574,7 +574,7 @@ int fdevent_connect_status(int fd) {
 #if defined(__APPLE__) && defined(__MACH__)
 #include <TargetConditionals.h> /* TARGET_OS_IPHONE, TARGET_OS_MAC */
 #if TARGET_OS_IPHONE            /* iOS, tvOS, or watchOS device */
-/*#define TCPS_CLOSE_WAIT 5*/   /* ??? which header contains this, if any ??? */
+#define TCPS_CLOSE_WAIT 5       /* ??? which header contains this, if any ??? */
 #elif TARGET_OS_MAC             /* MacOS */
 #include <netinet/tcp_fsm.h>
 #endif

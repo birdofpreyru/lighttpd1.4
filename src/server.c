@@ -2257,6 +2257,10 @@ static int main_init_once (void) {
 #define server_status_running(srv) do { } while (0)
 #endif
 
+#ifdef BUILD_LIBRARY
+# include "library-wrap.h"
+#endif
+
 __attribute_cold__
 int main (int argc, char ** argv) {
     if (!main_init_once()) return -1;
