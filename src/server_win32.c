@@ -295,7 +295,7 @@ void fdevent_win32_init (volatile sig_atomic_t *ptr);
 #ifdef BUILD_LIBRARY
 int lighttpd_main (int argc, char ** argv, void(*callback)());
 #   define main(a,b) lighttpd_win_main(a, b, void(*callback)())
-#elif
+#else
 __attribute_cold__
 int lighttpd_main (int argc, char ** argv);
 #endif
