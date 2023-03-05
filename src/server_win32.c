@@ -218,8 +218,12 @@ static void lighttpd_ServiceStatus (DWORD dwCurrentState, DWORD dwWin32ExitCode,
   lighttpd_ServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, dwWaitHint + 1000);
 
 
+#ifdef BUILD_LIBRARY
+int lighttpd_main (int argc, char ** argv, void(*callback)());
+#else
 __attribute_cold__
 int main (int argc, char ** argv);
+#endif
 
 static int svc_main_argc;
 static char ** svc_main_argv;
@@ -242,7 +246,11 @@ static void lighttpd_ServiceMain (DWORD dwNumServicesArgs, LPSTR *lpServiceArgVe
         argv = lpServiceArgVectors;
     }
 
+    #ifdef BUILD_LIBRARY
+    lighttpd_main(argc, argv, NULL);
+    #else
     main(argc, argv);
+    #endif
 
     lighttpd_ServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
     CloseHandle(hStatus);
@@ -293,7 +301,6 @@ static void lighttpd_ServiceCtrlDispatcher (int argc, char ** argv)
 void fdevent_win32_init (volatile sig_atomic_t *ptr);
 
 #ifdef BUILD_LIBRARY
-int lighttpd_main (int argc, char ** argv, void(*callback)());
 #   define main(a,b) lighttpd_win_main(a, b, void(*callback)())
 #else
 __attribute_cold__

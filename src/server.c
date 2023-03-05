@@ -1566,6 +1566,7 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	 * An open file descriptor has an underlying operating system HANDLE.
 	 * However, standard handles are cached at program startup,
 	 * so we try to match them all back up after redirection. */
+	 /*
 	if (   NULL == freopen("nul:", "rb", stdin)
 	    || NULL == freopen("nul:", "wb", stdout)
 	    || (_fileno(stderr) == -2
@@ -1577,6 +1578,7 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	SetStdHandle(STD_OUTPUT_HANDLE,(HANDLE)_get_osfhandle(_fileno(stdout)));
 	SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
 	fdevent_setfd_cloexec(STDERR_FILENO);
+	*/
   #else
 	{
 		struct stat st;

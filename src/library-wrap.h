@@ -119,16 +119,40 @@ static void lighttpd_main_loop (server * const srv, void (*callback)())
 #define server_main_loop(srv) lighttpd_main_loop((srv), callback);
 
 __attribute_cold__
-int lighttpd_launch(const char * config_path, void (*callback)()) {
+int lighttpd_launch(
+    const char * config_path,
+    const char * modules_path, // TODO: This should be wired up here,
+                               // and in native and JS sides for all platforms.
+    void (*callback)()
+) {
+    /*
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    */
+
     if (!config_path) return -1;
 
     optind = 1;
-    char *argv[] = { "lighttpd", "-D", "-f", (char*)config_path, NULL };
+
+    char *argv[] = {
+        "lighttpd",
+        "-D",
+        "-f", (char*)config_path,
+        NULL, NULL, NULL
+    };
+
+    int argc = 4;
+    if (modules_path) {
+        argv[4] = "-m";
+        argv[5] = (char*)modules_path;
+        argc = 6;
+    }
 
     #ifdef _WIN32
-        return lighttpd_win_main(4, argv, callback);
+        return lighttpd_win_main(argc, argv, callback);
     #else
-        return lighttpd_main(4, argv, callback);
+        return lighttpd_main(argc, argv, callback);
     #endif
 }
 
