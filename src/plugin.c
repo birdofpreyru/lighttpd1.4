@@ -162,7 +162,12 @@ int plugins_load(server *srv) {
 		                       CONST_STR_LEN("_plugin_init"));
 	  #ifdef _WIN32
 		init = (int(WINAPI *)(plugin *))(intptr_t)
-		  GetProcAddress(GetModuleHandle(NULL), tb->ptr);
+		  /* NOTE: The upstream at the next code line does
+		   * GetProcAddress(GetModuleHandle(NULL), tb->ptr);
+		   * but it does not work for our Lighttpd use case as a shared library,
+		   * because its module is then different from the main module of the app
+		   * using it. */
+		  GetProcAddress(LoadPackagedLibrary(L"ReactNativeStaticServer\\lighttpd.dll", 0), tb->ptr);
 	  #else
 		init = (int (*)(plugin *))(intptr_t)dlsym(RTLD_DEFAULT, tb->ptr);
 	  #endif
