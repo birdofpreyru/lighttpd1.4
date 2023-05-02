@@ -44,6 +44,12 @@
 #define __declspec_dllimport__
 #endif
 
+/* TODO: This is a temporary workaround for built-in modules support
+ * in MinGW (MSYS2 UCRT64); the ultimate solution is probably to correct
+ * preprocessor conditions above to ensure __declspec_dllexport__ is
+ * defined for these builds. */
+#define __declspec_dllexport__  __declspec(dllexport)
+
 #ifdef _WIN32
 /* https://learn.microsoft.com/en-us/windows/win32/winprog/using-the-windows-headers */
 /* http://web.archive.org/web/20121219084749/http://support.microsoft.com/kb/166474 */
