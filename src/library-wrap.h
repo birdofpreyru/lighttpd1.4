@@ -155,9 +155,10 @@ JNIEXPORT void JNICALL Java_com_lighttpd_Server_gracefulShutdown(
 
 #else
 
-int server_main(int argc, char ** argv, void (*callback)());
+int server_main_win32(int argc, char ** argv, void (*callback)());
 
 #ifndef _WIN32 // NOTE: For Win32 it is defined inside server_win32.c
+int server_main(int argc, char ** argv, void (*callback)());
 static void server_status_running (void (*callback)())
 {
     if (callback) callback();
