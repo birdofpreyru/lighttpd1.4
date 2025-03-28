@@ -1160,6 +1160,9 @@ static int process_ssi_stmt(request_st * const r, handler_ctx * const p, const c
 		/* send cmd output to a temporary file */
 		if (0 != chunkqueue_append_mem_to_tempfile(cq, "", 0, errh)) break;
 		c = cq->last;
+		off_t flen = c->file.length;
+		if (flen && flen != lseek(c->file.fd, flen, SEEK_SET))
+			log_perror(errh, __FILE__, __LINE__, "lseek failed");
 
 		int status = 0;
 		struct stat stb;
@@ -1184,7 +1187,7 @@ static int process_ssi_stmt(request_st * const r, handler_ctx * const p, const c
 			if (0 == fstat(c->file.fd, &stb)) {
 			}
 		}
-		chunkqueue_update_file(cq, c, stb.st_size);
+		chunkqueue_update_file(cq, c, stb.st_size - flen);
 		break;
 	}
 	case SSI_IF: {
@@ -1601,8 +1604,8 @@ static int mod_ssi_handle_request(request_st * const r, handler_ctx * const p) {
 		http_etag_create(r->tmp_buf, &st, r->conf.etag_flags);
 		http_header_response_set(r, HTTP_HEADER_ETAG, CONST_STR_LEN("ETag"), BUF_PTR_LEN(r->tmp_buf));
 
-		const buffer * const mtime = http_response_set_last_modified(r, st.st_mtime);
-		http_response_handle_cachable(r, mtime, st.st_mtime);
+		const buffer * const mtime = http_response_set_last_modified(r, TIME64_CAST(st.st_mtime));
+		http_response_handle_cachable(r, mtime, TIME64_CAST(st.st_mtime));
 	}
 
 	/* Reset the modified time of included files */
