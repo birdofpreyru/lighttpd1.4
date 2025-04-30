@@ -590,7 +590,7 @@ static void server_free(server *srv) {
 
 __attribute_cold__
 __attribute_noinline__
-static void remove_pid_file(server *srv) {
+static void server_pid_file_remove(server *srv) {
 	if (pid_fd <= -2) return;
 	if (srv->srvconf.pid_file && 0 <= pid_fd) {
 		if (0 != ftruncate(pid_fd, 0)) {
@@ -610,6 +610,43 @@ static void remove_pid_file(server *srv) {
 			}
 		}
 	}
+}
+
+__attribute_cold__
+static int server_pid_file_open(server * const srv, int i_am_root) {
+    if (NULL == srv->srvconf.pid_file)
+        return 0;
+    const char * const pidfile = srv->srvconf.pid_file->ptr;
+
+    pid_fd = fdevent_open_cloexec(pidfile, 0, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                                  S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (-1 != pid_fd)
+        return 0;
+
+  #ifdef __linux__
+    if (errno == EACCES
+        && i_am_root && srv->srvconf.username && !srv->srvconf.changeroot)
+        /* root without CAP_DAC_OVERRIDE capability
+         * and pidfile owned by target user */
+        return 0;
+  #else
+    UNUSED(i_am_root);
+  #endif
+
+    struct stat st;
+    if (errno != EEXIST
+        || 0 != stat(pidfile, &st)
+        || !S_ISREG(st.st_mode)
+        || (pid_fd =
+              fdevent_open_cloexec(pidfile, 0,
+                                   O_WRONLY | O_CREAT | O_TRUNC,
+                                   S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))==-1){
+        log_perror(srv->errh, __FILE__, __LINE__,
+          "opening pid-file failed: %s", pidfile);
+        return -1;
+    }
+
+    return 0;
 }
 
 
@@ -1252,7 +1289,7 @@ static void server_graceful_state (server *srv) {
     }
     else {
         server_sockets_close(srv);
-        remove_pid_file(srv);
+        server_pid_file_remove(srv);
         /*(prevent more removal attempts)*/
         srv->srvconf.pid_file = NULL;
     }
@@ -1710,34 +1747,8 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 
 	/* open pid file BEFORE chroot */
 	if (-2 == pid_fd) pid_fd = -1; /*(initial startup state)*/
-	if (-1 == pid_fd && srv->srvconf.pid_file) {
-		const char *pidfile = srv->srvconf.pid_file->ptr;
-		if (-1 == (pid_fd = fdevent_open_cloexec(pidfile, 0, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
-			struct stat st;
-			if (errno != EEXIST) {
-				log_perror(srv->errh, __FILE__, __LINE__,
-				  "opening pid-file failed: %s", pidfile);
-				return -1;
-			}
-
-			if (0 != stat(pidfile, &st)) {
-				log_perror(srv->errh, __FILE__, __LINE__,
-				  "stating existing pid-file failed: %s", pidfile);
-			}
-
-			if (!S_ISREG(st.st_mode)) {
-				log_error(srv->errh, __FILE__, __LINE__,
-				  "pid-file exists and isn't regular file: %s", pidfile);
-				return -1;
-			}
-
-			if (-1 == (pid_fd = fdevent_open_cloexec(pidfile, 0, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH))) {
-				log_perror(srv->errh, __FILE__, __LINE__,
-				  "opening pid-file failed: %s", pidfile);
-				return -1;
-			}
-		}
-	}
+	if (-1 == pid_fd && 0 != server_pid_file_open(srv, i_am_root))
+		return -1;
 
 	{
 #ifdef HAVE_GETRLIMIT
@@ -1751,17 +1762,22 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 			log_perror(srv->errh, __FILE__, __LINE__, "getrlimit()");
 			use_rlimit = 0;
 		}
+		else if (0 == srv->srvconf.max_fds) {
+			/*(default upper limit of 4k if server.max-fds not specified)*/
+			/*(and if existing rlim_max >= 4096, whether or not root)*/
+			if (rlim.rlim_cur < 4096 && rlim.rlim_max >= 4096)
+				srv->srvconf.max_fds = 4096;
+		}
+		else if (i_am_root)
+				rlim.rlim_max = srv->srvconf.max_fds;
 
-		/**
-		 * if we are not root can can't increase the fd-limit above rlim_max, but we can reduce it
-		 */
 		if (use_rlimit && srv->srvconf.max_fds
 		    && (i_am_root || srv->srvconf.max_fds <= rlim.rlim_max)) {
 			/* set rlimits */
+			/* root can increase fd-limit above rlim_max, others can only reduce it */
 
 			rlim_t rlim_cur = rlim.rlim_cur;
 			rlim.rlim_cur = srv->srvconf.max_fds;
-			if (i_am_root) rlim.rlim_max = srv->srvconf.max_fds;
 
 			if (0 != setrlimit(RLIMIT_NOFILE, &rlim)) {
 				log_perror(srv->errh, __FILE__, __LINE__, "setrlimit()");
@@ -1905,6 +1921,21 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 		}
 #endif
 	}
+
+#if defined(HAVE_SYS_PRCTL_H) && defined(PR_CAP_AMBIENT)
+	/* clear Linux ambient capabilities, if any had been granted
+	 * (avoid leaking privileges to CGI or other subprocesses) */
+	if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0L, 0L, 0L) < 0) {
+		log_perror(srv->errh, __FILE__, __LINE__,
+		  "prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)");
+		return -1;
+	}
+#endif
+
+#ifdef __linux__ /*(might occur w/ root on Linux and w/ limited Capabilities)*/
+	if (-1 == pid_fd && 0 != server_pid_file_open(srv, 0))
+		return -1;
+#endif
 
 #ifdef HAVE_FORK
 	/* network is up, let's daemonize ourself */
@@ -2377,7 +2408,7 @@ int server_main (int argc, char ** argv) {
 
         /* clean-up */
         chunkqueue_internal_pipes(0);
-        remove_pid_file(srv);
+        server_pid_file_remove(srv);
         config_log_error_close(srv);
       #ifdef _WIN32
         fdevent_win32_cleanup();

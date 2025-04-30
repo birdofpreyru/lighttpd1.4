@@ -241,28 +241,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cygwin/cygwin-install-action@master
         with:
+          install-dir: D:\cygwin
+          allow-test-packages: true
           packages: >
             autoconf automake libtool m4 make
             cmake meson ninja scons
             gcc-g++ git pkgconf perl
             libpcre2-devel
-            libnettle-devel gnutls-devel mbedtls-devel libnss-devel libssl-devel
+            libnettle-devel
+            libgnutls-devel mbedtls-devel libnss-devel libssl-devel
             libbrotli-devel libdeflate-devel zlib-devel libzstd-devel
             libsasl2-devel libkrb5-devel libdbi-devel openldap-devel
             libmariadb-devel libpq-devel
             libmaxminddb-devel libunwind-devel lua-devel lua5.1-devel
             libxml2-devel libsqlite3-devel
             libintl-devel
-      - name: Update
-        shell: powershell
-        run: |
-          # (https://github.com/cygwin/cygwin-install-action/blob/master/action.yml)
-          Invoke-WebRequest https://cygwin.com/setup-x86_64.exe -OutFile C:\setup.exe
-          # because setup is a Windows GUI app, make it part of a pipeline to make
-          # PowerShell wait for it to exit
-          & C:\setup.exe -qgnO -t | Out-Default
       - name: Compile and Test
-        shell: C:\cygwin\bin\bash.exe --noprofile --norc -o igncr -eo pipefail '{0}'
+        shell: D:\cygwin\bin\bash.exe --noprofile --norc -o igncr -eo pipefail '{0}'
         run: |
           set -e
           export PATH=/usr/bin:$(cygpath ${SYSTEMROOT})/system32
