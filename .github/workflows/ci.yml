@@ -16,20 +16,27 @@ concurrency:
 
 jobs:
 
+  # note: could combine Linux-ubuntu-gcc and Linux-ubuntu-clang by using
+  #     strategy: matrix: compiler: ['gcc','clang']
+  #   but a bit excessive for combinatorial explosion of different build systems
+  # note: use compiler package gcc-multilib or clang-multilib
+  #   if platform not x64 or Windows
+
   Linux-ubuntu-gcc:
     runs-on: ubuntu-latest
-    name: Linux-ubuntu-${{matrix.platform}}-gcc
+    name: Linux-ubuntu-${{matrix.platform}}-${{matrix.compiler}}
     strategy:
       matrix:
         platform: ['x64']
+        compiler: ['gcc']
     steps:
       - uses: actions/checkout@v4
-      - uses: egor-tensin/setup-gcc@v1
-        with:
-          platform: ${{matrix.platform}}
       - name: Install packages
         run: |
-          sudo apt-get install build-essential \
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -yq --no-install-recommends \
+            build-essential ${{matrix.compiler}} \
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
@@ -50,18 +57,19 @@ jobs:
 
   Linux-ubuntu-clang:
     runs-on: ubuntu-latest
-    name: Linux-ubuntu-${{matrix.platform}}-clang
+    name: Linux-ubuntu-${{matrix.platform}}-${{matrix.compiler}}
     strategy:
       matrix:
         platform: ['x64']
+        compiler: ['clang']
     steps:
       - uses: actions/checkout@v4
-      - uses: egor-tensin/setup-clang@v1
-        with:
-          platform: ${{matrix.platform}}
       - name: Install packages
         run: |
-          sudo apt-get install build-essential \
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -yq --no-install-recommends \
+            build-essential ${{matrix.compiler}} \
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
@@ -239,6 +247,24 @@ jobs:
     steps:
       - run: git config --global core.autocrlf input
       - uses: actions/checkout@v4
+      - name: Set up env and create cache dir
+        id: env
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "CACHE_KEY=$(Get-Date -UFormat "%Y-%m")" -Encoding utf8NoBOM
+          New-Item -ItemType Directory -Force -Path D:\cygwin
+      - name: Cache Cygwin installation
+        uses: actions/cache@v4
+        with:
+          path: /cygwin
+          key: cygwin-${{ runner.os }}-${{ env.CACHE_KEY }}
+          restore-keys: |
+            cygwin-${{ runner.os }}-${{ env.CACHE_KEY }}
+      #- name: Create Cygwin package dir under Cygwin cache dir
+      #  shell: pwsh
+      #  run: |
+      #    New-Item -ItemType Directory -Force -Path D:\cygwin\packages
+      #    New-Item -ItemType SymbolicLink -Path D:\cygwin-packages -Target D:\cygwin\packages
       - uses: cygwin/cygwin-install-action@master
         with:
           install-dir: D:\cygwin
@@ -349,13 +375,14 @@ jobs:
             mariadb-connector-c-dev postgresql16-dev
             libmaxminddb-dev libunwind-dev lua5.1-dev lua5.4-dev
             libxml2-dev sqlite-dev
-            zlib-static openssl-libs-static
+            zlib-static openssl-libs-static pcre2-static
       - name: Compile and Test
         shell: alpine.sh {0}
         run: |
           set -e
+          export SHELL=/bin/sh
           # Alpine Linux wolfssl package built w/o features required by lighttpd
-          #('scons check_fullstatic' needs zlib-static openssl-libs-static)
+          #('scons check_fullstatic' needs *-static packages in list above)
           export NO_WOLFSSL=1
           cd "${{github.workspace}}" && scripts/ci-build.sh meson
           cd "${{github.workspace}}" && scripts/ci-build.sh cmake
@@ -384,6 +411,7 @@ jobs:
         shell: alpine.sh {0}
         run: |
           set -e
+          export SHELL=/bin/sh
           meson setup "${{github.workspace}}/build" -Dwarning_level=3
           meson compile -C "${{github.workspace}}/build" --verbose
           meson test -C "${{github.workspace}}/build" --verbose

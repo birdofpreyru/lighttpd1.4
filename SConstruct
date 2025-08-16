@@ -12,7 +12,7 @@ except NameError:
 	string_types = str
 
 package = 'lighttpd'
-version = '1.4.79'
+version = '1.4.80'
 
 underscorify_reg = re.compile('[^A-Z0-9]')
 def underscorify(id):
@@ -248,11 +248,11 @@ vars.AddVariables(
 	BoolVariable('with_maxminddb', 'enable MaxMind GeoIP2 support', 'no'),
 	BoolVariable('with_krb5', 'enable krb5 auth support', 'no'),
 	BoolVariable('with_ldap', 'enable ldap auth support', 'no'),
-	# with_libev not supported
 	# with_libunwind not supported
 	BoolVariable('with_lua', 'enable lua support', 'no'),
 	PackageVariable('with_mysql', 'enable mysql support', 'no'),
 	BoolVariable('with_openssl', 'enable openssl support', 'no'),
+	BoolVariable('with_boringssl', 'enable BoringSSL support', 'no'),
 	PackageVariable('with_gnutls', 'enable GnuTLS support', 'no'),
 	PackageVariable('with_mbedtls', 'enable mbedTLS support', 'no'),
 	PackageVariable('with_nss', 'enable NSS crypto support', 'no'),
@@ -428,6 +428,7 @@ if 1:
 		'malloc_trim',
 		'mallopt',
 		'mempcpy',
+		'memset_explicit',
 		'memset_s',
 		'mkostemp',
 		'mmap',
@@ -604,6 +605,16 @@ if 1:
 	if env['with_openssl']:
 		if not autoconf.CheckLibWithHeader('ssl', 'openssl/ssl.h', 'C'):
 			fail("Couldn't find openssl")
+		autoconf.env.Append(
+			CPPFLAGS = [ '-DHAVE_OPENSSL_SSL_H', '-DHAVE_LIBSSL'],
+			LIBSSL = 'ssl',
+			LIBSSLCRYPTO = 'crypto',
+			LIBCRYPTO = 'crypto',
+		)
+
+	if env['with_boringssl']:
+		if not autoconf.CheckLibWithHeader('ssl', 'openssl/ssl.h', 'C'):
+			fail("Couldn't find boringssl")
 		autoconf.env.Append(
 			CPPFLAGS = [ '-DHAVE_OPENSSL_SSL_H', '-DHAVE_LIBSSL'],
 			LIBSSL = 'ssl',
