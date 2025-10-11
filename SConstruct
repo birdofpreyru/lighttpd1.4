@@ -12,7 +12,7 @@ except NameError:
 	string_types = str
 
 package = 'lighttpd'
-version = '1.4.81'
+version = '1.4.82'
 
 underscorify_reg = re.compile('[^A-Z0-9]')
 def underscorify(id):
@@ -640,13 +640,22 @@ if 1:
 	if env['with_mbedtls']:
 		if not autoconf.CheckLibWithHeader('mbedtls', 'mbedtls/ssl.h', 'C'):
 			fail("Couldn't find mbedtls")
-		autoconf.env.Append(
-			CPPFLAGS = [ '-DHAVE_LIBMBEDCRYPTO' ],
-			LIBMBEDTLS = 'mbedtls',
-			LIBMBEDX509 = 'mbedx509',
-			LIBMBEDCRYPTO = 'mbedcrypto',
-			LIBCRYPTO = 'mbedcrypto',
-		)
+		if autoconf.CheckLibWithHeader('tfpsacrypto', 'tf-psa-crypto/version.h', 'C'):
+			autoconf.env.Append(
+				CPPFLAGS = [ '-DHAVE_LIBMBEDCRYPTO' ],
+				LIBMBEDTLS = 'mbedtls',
+				LIBMBEDX509 = 'mbedx509',
+				LIBMBEDCRYPTO = 'tfpsacrypto',
+				LIBCRYPTO = 'tfpsacrypto',
+			)
+		else:
+			autoconf.env.Append(
+				CPPFLAGS = [ '-DHAVE_LIBMBEDCRYPTO' ],
+				LIBMBEDTLS = 'mbedtls',
+				LIBMBEDX509 = 'mbedx509',
+				LIBMBEDCRYPTO = 'mbedcrypto',
+				LIBCRYPTO = 'mbedcrypto',
+			)
 
 	if env['with_nettle']:
 		if not autoconf.CheckLibWithHeader('nettle', 'nettle/nettle-types.h', 'C'):
