@@ -3,6 +3,7 @@
 #include "fdevent_impl.h"
 #include "fdevent.h"
 #include "buffer.h"
+#include "ck.h"
 #include "log.h"
 
 #include <stdlib.h>
@@ -29,6 +30,7 @@ fdevent_register (fdevents *ev, int fd, fdevent_handler handler, void *ctx)
     fdnode *fdn  = fdnode_init();
     ev->fdarray[(fdn->fda_ndx = ev->count++)] = fdn;
   #else
+    ck_assert(fd < (int)ev->maxfds);
     fdnode *fdn  = ev->fdarray[fd] = fdnode_init();
   #endif
     fdn->handler = handler;

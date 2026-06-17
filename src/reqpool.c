@@ -59,8 +59,11 @@ request_init_data (request_st * const r, connection * const con, server * const 
 
     r->http_method = HTTP_METHOD_UNSET;
     r->http_version = HTTP_VERSION_UNSET;
+  #if 0 /*(already zeroed by calloc())*/
+    r->resp_fn_step = 0;
     r->resp_header_len = 0;
     r->loops_per_request = 0;
+  #endif
     r->tmp_buf = srv->tmp_buf;
     r->resp_body_scratchpad = -1;
     r->server_name = &r->uri.authority;
@@ -105,6 +108,7 @@ request_reset (request_st * const r)
 
     http_response_reset(r);
 
+    r->resp_fn_step = 0;
     r->loops_per_request = 0;
     r->keep_alive = 0;
 
@@ -126,7 +130,6 @@ request_reset (request_st * const r)
     r->resp_body_scratchpad = -1;
     r->rqst_htags = 0;
 
-    r->async_callback = 0;
     r->error_handler_saved_status = 0;
     /*r->error_handler_saved_method = HTTP_METHOD_UNSET;*/
     /*(error_handler_saved_method value is not valid
@@ -183,13 +186,11 @@ __attribute_cold__
 static void request_plugin_ctx_check(request_st * const r, server * const srv) {
     /* plugins should have cleaned themselves up */
     for (uint32_t i = 0, used = srv->plugins.used; i < used; ++i) {
-        plugin *p = ((plugin **)(srv->plugins.ptr))[i];
-        plugin_data_base *pd = p->data;
-        if (!pd) continue;
+        plugin_data_base *pd = ((plugin_data_base **)(srv->plugins.ptr))[i];
         if (NULL == r->plugin_ctx[pd->id]
             && NULL == r->con->plugin_ctx[pd->id]) continue;
         log_error(r->conf.errh, __FILE__, __LINE__,
-          "missing cleanup in %s", p->name);
+          "missing cleanup in %s", pd->self->name);
         r->plugin_ctx[pd->id] = NULL;
         r->con->plugin_ctx[pd->id] = NULL;
     }

@@ -30,7 +30,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     int read_fd;
     int write_fd;
@@ -42,8 +41,36 @@ typedef struct {
     server *srv;
 } plugin_data;
 
+INIT_FUNC(mod_rrd_init);
+FREE_FUNC(mod_rrd_free);
+SETDEFAULTS_FUNC(mod_rrd_set_defaults);
+REQUEST_FUNC(mod_rrd_account);
+TRIGGER_FUNC(mod_rrd_trigger);
+static handler_t mod_rrd_waitpid_cb(server *srv, void *p_d, pid_t pid, int status);
+
+static const plugin mod_rrdtool_plugin = {
+  .name                         = "rrdtool",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_rrd_init,
+  .cleanup                      = mod_rrd_free,
+  .set_defaults                 = mod_rrd_set_defaults,
+  .handle_request_done          = mod_rrd_account,
+  .handle_trigger               = mod_rrd_trigger,
+  .handle_waitpid               = mod_rrd_waitpid_cb
+};
+
 INIT_FUNC(mod_rrd_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_rrdtool_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_rrdtool_plugin_init(plugin *p);
+int mod_rrdtool_plugin_init(plugin *p) {
+    memcpy(p, &mod_rrdtool_plugin, sizeof(plugin));
+    return 0;
 }
 
 static void mod_rrd_free_config(plugin_data * const p) {
@@ -149,12 +176,12 @@ static void mod_rrd_merge_config(plugin_config * const pconf, const config_plugi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_rrd_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_rrd_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_rrd_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_rrd_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -416,35 +443,18 @@ static handler_t mod_rrd_waitpid_cb(server *srv, void *p_d, pid_t pid, int statu
 }
 
 REQUESTDONE_FUNC(mod_rrd_account) {
-    plugin_data *p = p_d;
+    const plugin_data * const p = p_d;
     /*(0 == p->rrdtool_pid if never activated; not used)*/
     if (0 == p->rrdtool_pid) return HANDLER_GO_ON;
 
-    mod_rrd_patch_config(r, p);
-    rrd_config * const rrd = p->conf.rrd;
+    plugin_config pconf;
+    mod_rrd_patch_config(r, p, &pconf);
+    rrd_config * const rrd = pconf.rrd;
     if (NULL != rrd) {
+        /* thread-safety todo: atomics, or lock around modification */
         ++rrd->requests;
         rrd->bytes_written += http_request_stats_bytes_out(r);
         rrd->bytes_read    += http_request_stats_bytes_in(r);
     }
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_rrdtool_plugin_init(plugin *p);
-int mod_rrdtool_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "rrd";
-
-	p->init        = mod_rrd_init;
-	p->cleanup     = mod_rrd_free;
-	p->set_defaults= mod_rrd_set_defaults;
-
-	p->handle_trigger      = mod_rrd_trigger;
-	p->handle_waitpid      = mod_rrd_waitpid_cb;
-	p->handle_request_done = mod_rrd_account;
-
-	return 0;
 }

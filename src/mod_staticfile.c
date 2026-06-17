@@ -19,11 +19,33 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
+INIT_FUNC(mod_staticfile_init);
+SETDEFAULTS_FUNC(mod_staticfile_set_defaults);
+REQUEST_FUNC(mod_staticfile_subrequest);
+
+static const plugin mod_staticfile_plugin = {
+  .name                         = "staticfile",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_staticfile_init,
+  .set_defaults                 = mod_staticfile_set_defaults,
+  .handle_subrequest_start      = mod_staticfile_subrequest
+};
+
 INIT_FUNC(mod_staticfile_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_staticfile_plugin;
+    return pd;
+}
+
+#include <string.h>     /* memcpy */
+__attribute_cold__
+__declspec_dllexport__
+int mod_staticfile_plugin_init(plugin *p);
+int mod_staticfile_plugin_init(plugin *p) {
+    memcpy(p, &mod_staticfile_plugin, sizeof(plugin));
+    return 0;
 }
 
 static void mod_staticfile_merge_config_cpv(plugin_config * const pconf, const config_plugin_value_t * const cpv) {
@@ -48,12 +70,12 @@ static void mod_staticfile_merge_config(plugin_config * const pconf, const confi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_staticfile_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_staticfile_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_staticfile_merge_config(&p->conf,
+            mod_staticfile_merge_config(pconf,
                                         p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
@@ -125,29 +147,14 @@ mod_staticfile_process (request_st * const r, plugin_config * const pconf)
     return HANDLER_FINISHED;
 }
 
-URIHANDLER_FUNC(mod_staticfile_subrequest) {
+REQUEST_FUNC(mod_staticfile_subrequest) {
     if (NULL != r->handler_module) return HANDLER_GO_ON;
     if (!http_method_get_head_query_post(r->http_method)) return HANDLER_GO_ON;
     /* r->physical.path is non-empty for handle_subrequest_start */
     /*if (buffer_is_blank(&r->physical.path)) return HANDLER_GO_ON;*/
 
-    plugin_data * const p = p_d;
-    mod_staticfile_patch_config(r, p);
+    plugin_config pconf;
+    mod_staticfile_patch_config(r, p_d, &pconf);
 
-    return mod_staticfile_process(r, &p->conf);
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_staticfile_plugin_init(plugin *p);
-int mod_staticfile_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "staticfile";
-
-	p->init        = mod_staticfile_init;
-	p->handle_subrequest_start = mod_staticfile_subrequest;
-	p->set_defaults  = mod_staticfile_set_defaults;
-
-	return 0;
+    return mod_staticfile_process(r, &pconf);
 }

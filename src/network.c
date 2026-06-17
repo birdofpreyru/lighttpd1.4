@@ -82,6 +82,13 @@ static handler_t network_server_handle_fdevent(void *context, int revents) {
         int fd = fdevent_accept_listenfd(srv_socket->fd,
                                          (struct sockaddr *)&addr, &addrlen);
         if (-1 == fd) break;
+      #ifndef _WIN32
+        if (fd >= srv->max_fds) {
+            fdio_close_socket(fd);
+            errno = EBADF;
+            break;
+        }
+      #endif
 
         if (nagle_disable)
             network_accept_tcp_nagle_disable(fd);
@@ -985,10 +992,28 @@ int network_init(server *srv, int stdin_fd) {
         }
 
         /* reset sidx of any graceful sockets not explicitly listed in config */
+        const int unconf =
+          config_feature_bool(srv, "server.graceful-unconfig-sock", 0);
         for (uint32_t i = 0; i < srv->srv_sockets.used; ++i) {
-            if ((unsigned short)~0u == srv->srv_sockets.ptr[i]->sidx) {
+            if ((unsigned short)~0u != srv->srv_sockets.ptr[i]->sidx)
+                continue;
+            if (!unconf) {
                 srv->srv_sockets.ptr[i]->sidx = 0;
                 srv->srv_sockets.ptr[i]->is_ssl = p->defaults.ssl_enabled;
+            }
+            else {
+                server_socket * const srv_socket = srv->srv_sockets.ptr[i];
+                srv->srv_sockets.ptr[i] = /* copy last element in list */
+                  srv->srv_sockets.ptr[srv->srv_sockets.used-1];
+                srv->srv_sockets.ptr[srv->srv_sockets.used-1] = NULL;
+                --srv->srv_sockets.used;
+
+                if (srv_socket->fd != -1)
+                    fdio_close_socket(srv_socket->fd);
+                buffer_free(srv_socket->srv_token);
+                free(srv_socket);
+
+                --i;
             }
         }
 

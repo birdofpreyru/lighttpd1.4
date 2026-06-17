@@ -44,7 +44,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     buffer ldap_filter;
 } plugin_data;
@@ -53,16 +52,40 @@ static const char *default_cafile;
 
 static handler_t mod_authn_ldap_basic(request_st * const r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 
+INIT_FUNC(mod_authn_ldap_init);
+FREE_FUNC(mod_authn_ldap_free);
+SETDEFAULTS_FUNC(mod_authn_ldap_set_defaults);
+
+static const plugin mod_authn_ldap_plugin = {
+  .name                         = "authn_ldap",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_authn_ldap_init,
+  .cleanup                      = mod_authn_ldap_free,
+  .set_defaults                 = mod_authn_ldap_set_defaults
+};
+
 INIT_FUNC(mod_authn_ldap_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_authn_ldap_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_auth_backend_t http_auth_backend_ldap =
       { "ldap", mod_authn_ldap_basic, NULL, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_backend_ldap */
-    http_auth_backend_ldap.p_d = p;
+    http_auth_backend_ldap.p_d = pd;
     http_auth_backend_set(&http_auth_backend_ldap);
 
-    return p;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_authn_ldap_plugin_init(plugin *p);
+int mod_authn_ldap_plugin_init(plugin *p) {
+    memcpy(p, &mod_authn_ldap_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_authn_ldap_free) {
@@ -137,11 +160,11 @@ static void mod_authn_ldap_merge_config(plugin_config * const pconf, const confi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_authn_ldap_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_authn_ldap_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_authn_ldap_merge_config(&p->conf,
+            mod_authn_ldap_merge_config(pconf,
                                         p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
@@ -710,22 +733,24 @@ static handler_t mod_authn_ldap_memberOf(log_error_st *errh, plugin_config *s, c
 }
 
 static handler_t mod_authn_ldap_basic(request_st * const r, void *p_d, const http_auth_require_t * const require, const buffer * const username, const char * const pw) {
-    plugin_data *p = (plugin_data *)p_d;
     LDAP *ld;
     char *dn;
 
-    mod_authn_ldap_patch_config(r, p);
+    plugin_config pconf;
+    mod_authn_ldap_patch_config(r, p_d, &pconf);
 
-    if (pw[0] == '\0' && !p->conf.auth_ldap_allow_empty_pw)
+    if (pw[0] == '\0' && !pconf.auth_ldap_allow_empty_pw)
         return HANDLER_ERROR;
 
-    const buffer * const template = p->conf.auth_ldap_filter;
+    const buffer * const template = pconf.auth_ldap_filter;
     if (NULL == template)
         return HANDLER_ERROR;
 
     log_error_st * const errh = r->conf.errh;
 
     /* build filter to get DN for uid = username */
+    /* thread-safety todo: ldap_filter per-thread or allocate or borrow chunk */
+    plugin_data *p = (plugin_data *)p_d;
     buffer * const ldap_filter = &p->ldap_filter;
     buffer_clear(ldap_filter);
     if (*template->ptr == ',') {
@@ -749,39 +774,39 @@ static handler_t mod_authn_ldap_basic(request_st * const r, void *p_d, const htt
         }
 
         /* ldap_search for DN (synchronous; blocking) */
-        dn = mod_authn_ldap_get_dn(errh, p->conf.ldc,
-                                   p->conf.auth_ldap_basedn, ldap_filter->ptr);
+        dn = mod_authn_ldap_get_dn(errh, pconf.ldc,
+                                   pconf.auth_ldap_basedn, ldap_filter->ptr);
         if (NULL == dn) return HANDLER_ERROR;
     }
 
     /*(Check ldc here rather than further up to preserve historical behavior
-     * where p->conf.ldc above (was p->anon_conf above) is set of directives in
+     * where pconf.ldc above (was p->anon_conf above) is set of directives in
      * same context as auth_ldap_hostname.  Preference: admin intentions are
      * clearer if directives are always together in a set in same context)*/
 
-    plugin_config_ldap * const ldc_base = p->conf.ldc;
+    plugin_config_ldap * const ldc_base = pconf.ldc;
     plugin_config_ldap ldc_custom;
 
-    if ( p->conf.ldc->auth_ldap_starttls != p->conf.auth_ldap_starttls
-        || p->conf.ldc->auth_ldap_binddn != p->conf.auth_ldap_binddn
-        || p->conf.ldc->auth_ldap_bindpw != p->conf.auth_ldap_bindpw
-        || p->conf.ldc->auth_ldap_cafile != p->conf.auth_ldap_cafile ) {
+    if ( pconf.ldc->auth_ldap_starttls != pconf.auth_ldap_starttls
+        || pconf.ldc->auth_ldap_binddn != pconf.auth_ldap_binddn
+        || pconf.ldc->auth_ldap_bindpw != pconf.auth_ldap_bindpw
+        || pconf.ldc->auth_ldap_cafile != pconf.auth_ldap_cafile ) {
         ldc_custom.ldap = NULL;
         ldc_custom.errh = errh;
         ldc_custom.auth_ldap_hostname = ldc_base->auth_ldap_hostname;
-        ldc_custom.auth_ldap_starttls = p->conf.auth_ldap_starttls;
-        ldc_custom.auth_ldap_binddn = p->conf.auth_ldap_binddn;
-        ldc_custom.auth_ldap_bindpw = p->conf.auth_ldap_bindpw;
-        ldc_custom.auth_ldap_cafile = p->conf.auth_ldap_cafile;
+        ldc_custom.auth_ldap_starttls = pconf.auth_ldap_starttls;
+        ldc_custom.auth_ldap_binddn = pconf.auth_ldap_binddn;
+        ldc_custom.auth_ldap_bindpw = pconf.auth_ldap_bindpw;
+        ldc_custom.auth_ldap_cafile = pconf.auth_ldap_cafile;
         ldc_custom.auth_ldap_timeout= ldc_base->auth_ldap_timeout;
-        p->conf.ldc = &ldc_custom;
+        pconf.ldc = &ldc_custom;
     }
 
     handler_t rc = HANDLER_ERROR;
     do {
         /* auth against LDAP server (synchronous; blocking) */
 
-        ld = mod_authn_ldap_host_init(errh, p->conf.ldc);
+        ld = mod_authn_ldap_host_init(errh, pconf.ldc);
         if (NULL == ld)
             break;
 
@@ -802,28 +827,14 @@ static handler_t mod_authn_ldap_basic(request_st * const r, void *p_d, const htt
             rc = HANDLER_GO_ON; /* access granted */
         }
         else if (require->group.used) {
-            /*(must not re-use ldap_filter, since it might be used for dn)*/
-            rc = mod_authn_ldap_memberOf(errh,&p->conf,require,username,dn);
+            /*(must not reuse ldap_filter, since it might be used for dn)*/
+            rc = mod_authn_ldap_memberOf(errh, &pconf, require, username, dn);
         }
     } while (0);
 
     if (NULL != ld) ldap_destroy(ld);
-    if (ldc_base != p->conf.ldc && NULL != p->conf.ldc->ldap)
-        ldap_unbind_ext_s(p->conf.ldc->ldap, NULL, NULL);
+    if (ldc_base != pconf.ldc && NULL != pconf.ldc->ldap)
+        ldap_unbind_ext_s(pconf.ldc->ldap, NULL, NULL);
     if (dn != ldap_filter->ptr) ldap_memfree(dn);
     return rc;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_authn_ldap_plugin_init(plugin *p);
-int mod_authn_ldap_plugin_init(plugin *p) {
-    p->version     = LIGHTTPD_VERSION_ID;
-    p->name        = "authn_ldap";
-    p->init        = mod_authn_ldap_init;
-    p->set_defaults = mod_authn_ldap_set_defaults;
-    p->cleanup     = mod_authn_ldap_free;
-
-    return 0;
 }

@@ -275,13 +275,14 @@ chunk_file_pread_chunk (chunk *c, void *buf, size_t count)
 static void chunk_reset_file_chunk(chunk *c) {
 	if (c->file.is_temp) {
 		c->file.is_temp = 0;
-	  #ifdef _WIN32 /*(not expecting c->file.refchg w/ .is_temp)*/
-		if (!c->file.refchg && c->file.fd != -1) {
+		/* close() whether or not c->file.refchg since
+		 * chunk_refchg_file_chunk_temp() only does unlink();
+		 * close() before unlink() for _WIN32 */
+		if (c->file.fd != -1) {
 			fdio_close_file(c->file.fd);
 			c->file.fd = -1;
 		}
-	  #endif
-		if (!buffer_is_blank(c->mem))
+		if (!c->file.refchg && !buffer_is_blank(c->mem))
 			unlink(c->mem->ptr);
 	}
 	if (c->file.refchg) {
@@ -773,12 +774,54 @@ const char *chunkqueue_env_tmpdir(void) {
     return env_tmpdir;
 }
 
+struct chunk_ref_file_chunk_temp { int refcnt; buffer path; };
+
+static void chunk_refchg_file_chunk_temp(void *data, int mod) {
+    /* reference counting on temp file is for unlink() only, not fd
+     * and is different from stat_cache_entry reference counting.
+     * Note: 206 Partial Content handling with many ranges could be
+     * inefficient re-opening temporary files, but avoids excess open fd */
+    /*(expect mod == -1 or mod == 1)*/
+    struct chunk_ref_file_chunk_temp * const restrict d = data;
+    if (0 == (d->refcnt += mod)) {
+        if (!buffer_is_blank(&d->path))
+            unlink(d->path.ptr);
+        free(d->path.ptr);
+        free(d);
+    }
+}
+
+__attribute_cold__
 __attribute_noinline__
-static void chunkqueue_dup_file_chunk_fd (chunk * const restrict d, const chunk * const restrict c) {
+static void chunkqueue_dup_file_chunk_fd (chunk * const restrict d, chunk * const restrict c) {
     /*assert(d != c);*/
     /*assert(d->type == FILE_CHUNK);*/
     /*assert(c->type == FILE_CHUNK);*/
-    if (c->file.fd >= 0) {
+
+    /* special-case multiple references to temporary files so that temp files
+     * do not get unlink() called prematurely.  This is for http_range.[ch] to
+     * handle range(s) from temp files when constructing 206 Partial Content.
+     * (Range handling occurs right before sending response headers.  Otherwise,
+     * putting references to same temporary file at end of multiple chunk queues
+     * and then adding more data (which might be written into temporary file if
+     * not careful) could corrupt content of temporary file.) */
+    if (c->file.is_temp) {
+        if (!c->file.refchg) {
+            struct chunk_ref_file_chunk_temp *ref = ck_calloc(1, sizeof(*ref));
+            ref->refcnt = 1;
+            c->file.ref = ref;
+            c->file.refchg = chunk_refchg_file_chunk_temp;
+            buffer_copy_buffer(&ref->path, c->mem);
+        }
+        d->file.is_temp = 1;
+        /*(avoid excess fd usage for temporary files with multi Range requests;
+         * skip fdevent_dup_cloexec() if c->file.fd >= 0)*/
+        /*d->file.fd = -1;*/
+        d->file.ref = c->file.ref;
+        d->file.refchg = c->file.refchg;
+        d->file.refchg(d->file.ref, 1);
+    }
+    else if (c->file.fd >= 0) {
         if (c->file.refchg) {
             d->file.fd = c->file.fd;
             d->file.ref = c->file.ref;
@@ -787,15 +830,15 @@ static void chunkqueue_dup_file_chunk_fd (chunk * const restrict d, const chunk 
         }
         else
             d->file.fd = fdevent_dup_cloexec(c->file.fd);
-      #ifdef HAVE_MMAP
-        if ((d->file.view = c->file.view))
-            ++d->file.view->refcnt;
-      #endif
     }
+  #ifdef HAVE_MMAP
+    if ((d->file.view = c->file.view))
+        ++d->file.view->refcnt;
+  #endif
 }
 
 __attribute_noinline__
-static void chunkqueue_steal_partial_file_chunk(chunkqueue * const restrict dest, const chunk * const restrict c, const off_t len) {
+static void chunkqueue_steal_partial_file_chunk(chunkqueue * const restrict dest, chunk * const restrict c, const off_t len) {
     chunkqueue_append_file(dest, c->mem, c->offset, len);
     chunkqueue_dup_file_chunk_fd(dest->last, c);
 }
@@ -1333,7 +1376,7 @@ void chunkqueue_append_cq_range (chunkqueue * const dst, const chunkqueue * cons
     /* (dst cq and src cq can be the same cq, so neither is marked restrict) */
 
     /* copy and append range len from src to dst */
-    for (const chunk *c = src->first; len > 0 && c != NULL; c = c->next) {
+    for (chunk *c = src->first; len > 0 && c != NULL; c = c->next) {
         /* scan into src to range offset (also skips empty chunks) */
         off_t clen = chunk_remaining_length(c);
         if (offset >= clen) {

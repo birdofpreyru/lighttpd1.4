@@ -193,8 +193,8 @@ typedef struct {
 
 static int ssl_is_init;
 /* need assigned p->id for deep access of module handler_ctx for connection
- *   i.e. handler_ctx *hctx = con->plugin_ctx[plugin_data_singleton->id]; */
-static plugin_data *plugin_data_singleton;
+ *   i.e. handler_ctx *hctx = con->plugin_ctx[mod_wolfssl_plugin_data->id]; */
+static plugin_data *mod_wolfssl_plugin_data;
 #define LOCAL_SEND_BUFSIZE (16 * 1024)
 static char *local_send_buffer;
 static int feature_refresh_certs;
@@ -508,8 +508,8 @@ mod_openssl_session_ticket_key_file (const char *fn)
      *    4-byte - activation timestamp
      *    4-byte - expiration timestamp
      *   16-byte - session ticket key name
-     *   32-byte - session ticket HMAC encrpytion key
-     *   32-byte - session ticket AES encrpytion key
+     *   32-byte - session ticket HMAC encryption key
+     *   32-byte - session ticket AES encryption key
      *
      * STEK file can be created with a command such as:
      *   dd if=/dev/random bs=1 count=80 status=none | \
@@ -604,13 +604,52 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
 #endif
 
 
+INIT_FUNC(mod_openssl_init);
+FREE_FUNC(mod_openssl_free);
+SETDEFAULTS_FUNC(mod_openssl_set_defaults);
+CONNECTION_FUNC(mod_openssl_handle_con_accept);
+CONNECTION_FUNC(mod_openssl_handle_con_shut_wr);
+CONNECTION_FUNC(mod_openssl_handle_con_close);
+REQUEST_FUNC(mod_openssl_handle_uri_raw);
+REQUEST_FUNC(mod_openssl_handle_request_env);
+REQUEST_FUNC(mod_openssl_handle_request_reset);
+TRIGGER_FUNC(mod_openssl_handle_trigger);
+
+static const plugin mod_wolfssl_plugin = {
+  .name                         = "openssl",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_openssl_init,
+  .cleanup                      = mod_openssl_free,
+  .priv_defaults                = mod_openssl_set_defaults,
+  .handle_connection_accept     = mod_openssl_handle_con_accept,
+  .handle_connection_shut_wr    = mod_openssl_handle_con_shut_wr,
+  .handle_connection_close      = mod_openssl_handle_con_close,
+  .handle_uri_raw               = mod_openssl_handle_uri_raw,
+  .handle_request_env           = mod_openssl_handle_request_env,
+  .handle_request_reset         = mod_openssl_handle_request_reset,
+  .handle_trigger               = mod_openssl_handle_trigger
+};
+
+
 INIT_FUNC(mod_openssl_init)
 {
-    plugin_data_singleton = (plugin_data *)ck_calloc(1, sizeof(plugin_data));
   #ifdef DEBUG_WOLFSSL
     wolfSSL_Debugging_ON();
   #endif
-    return plugin_data_singleton;
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_wolfssl_plugin;
+    mod_wolfssl_plugin_data = pd;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_wolfssl_plugin_init (plugin *p);
+int mod_wolfssl_plugin_init (plugin *p)
+{
+    memcpy(p, &mod_wolfssl_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -645,10 +684,8 @@ static void mod_openssl_free_openssl (void)
     stek_rotate_ts = 0;
   #endif
 
-    if (wolfSSL_Cleanup() != WOLFSSL_SUCCESS) {
-        log_error(plugin_data_singleton->srv->errh, __FILE__, __LINE__,
-          "SSL: wolfSSL_Cleanup() failed");
-    }
+    if (wolfSSL_Cleanup() != WOLFSSL_SUCCESS)
+        log_error(NULL, __FILE__, __LINE__, "SSL: wolfSSL_Cleanup() failed");
 
     free(local_send_buffer);
     ssl_is_init = 0;
@@ -865,7 +902,7 @@ mod_wolfssl_load_pem_file (const char *fn, log_error_st *errh, buffer ***chain)
     }
 
   #if LIBWOLFSSL_VERSION_HEX >= 0x04002000
-    if (certs && !mod_wolfssl_cert_is_active(certs[0]))
+    if (certs && !mod_wolfssl_cert_is_active(certs[0]) && log_epoch_secs > 300)
         log_error(errh, __FILE__, __LINE__,
           "SSL: inactive/expired X509 certificate '%s'", fn);
   #endif
@@ -919,7 +956,7 @@ mod_wolfssl_load_raw_file (const char *fn, log_error_st *errh, buffer ***chain)
         e += sizeof(PEM_END_CERT)-1;
         if (NULL == buffer_append_base64_decode(der,b,len,BASE64_STANDARD))
             break;
-        if (!mod_wolfssl_cert_is_active(der))
+        if (!mod_wolfssl_cert_is_active(der) && log_epoch_secs > 300)
             log_error(errh, __FILE__, __LINE__,
               "SSL: inactive/expired X509 certificate '%s'", fn);
     } while (0);
@@ -1251,7 +1288,7 @@ mod_openssl_merge_config(plugin_config * const pconf, const config_plugin_value_
 static void
 mod_openssl_patch_config (request_st * const r, plugin_config * const pconf)
 {
-    plugin_data * const p = plugin_data_singleton;
+    plugin_data * const p = mod_wolfssl_plugin_data;
     memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
@@ -2118,8 +2155,7 @@ mod_openssl_alpn_select_cb (SSL *ssl, const unsigned char **out, unsigned char *
             if (in[i] == 'h' && in[i+1] == '2') {
                 if (!hctx->r->conf.h2proto) continue;
                 proto = MOD_OPENSSL_ALPN_H2;
-                if (hctx->r->handler_module == NULL)/*(e.g. not mod_sockproxy)*/
-                    hctx->r->http_version = HTTP_VERSION_2;
+                hctx->r->http_version = HTTP_VERSION_2;
                 break;
             }
             continue;
@@ -2295,10 +2331,23 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
      * more limited by additional preprocessor directives
      *   defined(OPENSSL_EXTRA) && defined(HAVE_ECC) &&
      *   defined(WOLFSSL_TLS13) && defined(HAVE_SUPPORTED_CURVES)
+     * However, PQC hybrid MLKEMs are accepted by wolfSSL_CTX_set1_groups_list()
+     * and rejected by wolfSSL_CTX_set1_curves_list().
      */
     const char *groups = ssl_ec_curve && !buffer_is_blank(ssl_ec_curve)
       ? ssl_ec_curve->ptr
       :
+       #if (defined(WOLFSSL_PQC_HYBRIDS) /* wolfssl 5.9.0 */ \
+            || (defined(HAVE_PQC) || defined(WOLFSSL_HAVE_MLKEM))) \
+           && !defined(WOLFSSL_NO_ML_KEM) /* wolfssl 5.8.4 */ \
+           && defined(WOLFSSL_TLS13)
+        #ifdef HAVE_CURVE25519
+        "X25519MLKEM768:"
+        #endif
+        #ifdef HAVE_ECC
+        /*"SecP256r1MLKEM768:"*/
+        #endif
+       #endif
        #ifdef HAVE_CURVE25519
         "X25519"
        #endif
@@ -2315,7 +2364,15 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
         "X448"
        #endif
         ;
-    if (WOLFSSL_SUCCESS != wolfSSL_CTX_set1_curves_list(s->ssl_ctx, groups)) {
+  #if (defined(WOLFSSL_PQC_HYBRIDS) /* wolfssl 5.9.0 */ \
+       || (defined(HAVE_PQC) || defined(WOLFSSL_HAVE_MLKEM))) \
+      && !defined(WOLFSSL_NO_ML_KEM) /* wolfssl 5.8.4 */ \
+      && defined(WOLFSSL_TLS13)
+    if (WOLFSSL_SUCCESS != wolfSSL_CTX_set1_groups_list(s->ssl_ctx, groups))
+  #else
+    if (WOLFSSL_SUCCESS != wolfSSL_CTX_set1_curves_list(s->ssl_ctx, groups))
+  #endif
+    {
         log_error(srv->errh, __FILE__, __LINE__,
           "SSL: Unknown to set groups %s", groups);
         return 0;
@@ -3175,7 +3232,7 @@ mod_openssl_close_notify(handler_ctx *hctx);
 static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_wolfssl_plugin_data->id];
 
     if (__builtin_expect( (0 != hctx->close_notify), 0))
         return mod_openssl_close_notify(hctx);
@@ -3237,7 +3294,7 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
 static int
 connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_wolfssl_plugin_data->id];
     int len;
     char *mem = NULL;
     size_t mem_len = 0;
@@ -3941,29 +3998,6 @@ TRIGGER_FUNC(mod_openssl_handle_trigger) {
   #endif
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_wolfssl_plugin_init (plugin *p);
-int mod_wolfssl_plugin_init (plugin *p)
-{
-    p->version      = LIGHTTPD_VERSION_ID;
-    p->name         = "wolfssl";
-    p->init         = mod_openssl_init;
-    p->cleanup      = mod_openssl_free;
-    p->priv_defaults= mod_openssl_set_defaults;
-
-    p->handle_connection_accept  = mod_openssl_handle_con_accept;
-    p->handle_connection_shut_wr = mod_openssl_handle_con_shut_wr;
-    p->handle_connection_close   = mod_openssl_handle_con_close;
-    p->handle_uri_raw            = mod_openssl_handle_uri_raw;
-    p->handle_request_env        = mod_openssl_handle_request_env;
-    p->handle_request_reset      = mod_openssl_handle_request_reset;
-    p->handle_trigger            = mod_openssl_handle_trigger;
-
-    return 0;
 }
 
 

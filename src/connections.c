@@ -347,9 +347,9 @@ static int connection_handle_write_state(request_st * const r, connection * cons
             return CON_STATE_RESPONSE_END;
         }
 
-        if (r->handler_module && !r->resp_body_finished) {
-            const plugin * const p = r->handler_module;
-            if (p->handle_subrequest(r, p->data) > HANDLER_WAIT_FOR_EVENT) {
+        plugin_data_base * const pd = r->handler_module;
+        if (pd && !r->resp_body_finished) {
+            if (pd->self->handle_subrequest(r, pd) > HANDLER_WAIT_FOR_EVENT) {
                 connection_set_state_error(r, CON_STATE_ERROR);
                 return CON_STATE_ERROR;
             }
@@ -839,10 +839,9 @@ connection_state_machine (connection * const con)
 {
     int rc = !con->fn || con->fn->process_streams(con, http_response_handler,
                                                        connection_handle_write);
-    request_st * const r = &con->request;
     if (rc)
-        connection_state_machine_loop(r, con);
-    connection_set_fdevent_interest(r, con);
+        connection_state_machine_loop(&con->request, con);
+    connection_set_fdevent_interest(&con->request, con);
 }
 
 

@@ -40,23 +40,46 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     int initonce;
 } plugin_data;
 
 static handler_t mod_authn_sasl_basic(request_st *r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 
+INIT_FUNC(mod_authn_sasl_init);
+FREE_FUNC(mod_authn_sasl_free);
+SETDEFAULTS_FUNC(mod_authn_sasl_set_defaults);
+
+static const plugin mod_authn_sasl_plugin = {
+  .name                         = "authn_sasl",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_authn_sasl_init,
+  .cleanup                      = mod_authn_sasl_free,
+  .set_defaults                 = mod_authn_sasl_set_defaults
+};
+
 INIT_FUNC(mod_authn_sasl_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_authn_sasl_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_auth_backend_t http_auth_backend_sasl =
       { "sasl", mod_authn_sasl_basic, NULL, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_backend_sasl */
-    http_auth_backend_sasl.p_d = p;
+    http_auth_backend_sasl.p_d = pd;
     http_auth_backend_set(&http_auth_backend_sasl);
 
-    return p;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_authn_sasl_plugin_init(plugin *p);
+int mod_authn_sasl_plugin_init(plugin *p) {
+    memcpy(p, &mod_authn_sasl_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_authn_sasl_free) {
@@ -95,12 +118,12 @@ static void mod_authn_sasl_merge_config(plugin_config * const pconf, const confi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_authn_sasl_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_authn_sasl_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_authn_sasl_merge_config(&p->conf,
+            mod_authn_sasl_merge_config(pconf,
                                         p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
@@ -219,17 +242,17 @@ SETDEFAULTS_FUNC(mod_authn_sasl_set_defaults) {
     return HANDLER_GO_ON;
 }
 
-static int mod_authn_sasl_cb_getopt(void *p_d, const char *plugin_name, const char *opt, const char **res, unsigned *len) {
-    plugin_data *p = (plugin_data *)p_d;
+static int mod_authn_sasl_cb_getopt(void *p_c, const char *plugin_name, const char *opt, const char **res, unsigned *len) {
+    const plugin_config * const pconf = (plugin_config *)p_c;
     size_t sz;
 
     if (0 == strcmp(opt, "pwcheck_method")) {
-        *res = p->conf.pwcheck_method->ptr;
-        sz = buffer_clen(p->conf.pwcheck_method);
+        *res = pconf->pwcheck_method->ptr;
+        sz = buffer_clen(pconf->pwcheck_method);
     }
-    else if (0 == strcmp(opt, "sasldb_path") && p->conf.sasldb_path) {
-        *res = p->conf.sasldb_path->ptr;
-        sz = buffer_clen(p->conf.sasldb_path);
+    else if (0 == strcmp(opt, "sasldb_path") && pconf->sasldb_path) {
+        *res = pconf->sasldb_path->ptr;
+        sz = buffer_clen(pconf->sasldb_path);
     }
     else if (0 == strcmp(opt, "auxprop_plugin")) {
         *res = "sasldb";
@@ -266,17 +289,17 @@ static int mod_authn_sasl_cb_log(void *vreq, int level, const char *message) {
     return SASL_OK;
 }
 
-static handler_t mod_authn_sasl_query(request_st * const r, void *p_d, const buffer * const username, const char * const realm, const char * const pw) {
-    plugin_data *p = (plugin_data *)p_d;
+static handler_t mod_authn_sasl_query(request_st * const r, plugin_data * const p, const buffer * const username, const char * const realm, const char * const pw) {
+    plugin_config pconf;
     sasl_conn_t *sc;
     sasl_callback_t const cb[] = {
-      { SASL_CB_GETOPT,   (int(*)(void))(uintptr_t)mod_authn_sasl_cb_getopt, (void *) p },
+      { SASL_CB_GETOPT,   (int(*)(void))(uintptr_t)mod_authn_sasl_cb_getopt, (void *) &pconf },
       { SASL_CB_LOG,      (int(*)(void))(uintptr_t)mod_authn_sasl_cb_log, (void *) r },
       { SASL_CB_LIST_END, NULL, NULL }
     };
     int rc;
 
-    mod_authn_sasl_patch_config(r, p);
+    mod_authn_sasl_patch_config(r, p, &pconf);
 
     if (!p->initonce) {
         /* must be done once, but after fork() if multiple lighttpd workers */
@@ -285,7 +308,7 @@ static handler_t mod_authn_sasl_query(request_st * const r, void *p_d, const buf
         p->initonce = 1;
     }
 
-    rc = sasl_server_new(p->conf.service, p->conf.fqdn,
+    rc = sasl_server_new(pconf.service, pconf.fqdn,
                          realm, NULL, NULL, cb, 0, &sc);
     if (SASL_OK == rc) {
         rc = sasl_checkpass(sc, BUF_PTR_LEN(username), pw, strlen(pw));
@@ -302,18 +325,4 @@ static handler_t mod_authn_sasl_basic(request_st * const r, void *p_d, const htt
     return http_auth_match_rules(require, username->ptr, NULL, NULL)
       ? HANDLER_GO_ON  /* access granted */
       : HANDLER_ERROR;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_authn_sasl_plugin_init(plugin *p);
-int mod_authn_sasl_plugin_init(plugin *p) {
-    p->version     = LIGHTTPD_VERSION_ID;
-    p->name        = "authn_sasl";
-    p->init        = mod_authn_sasl_init;
-    p->set_defaults= mod_authn_sasl_set_defaults;
-    p->cleanup     = mod_authn_sasl_free;
-
-    return 0;
 }

@@ -48,7 +48,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 static handler_t mod_authn_file_htdigest_digest(request_st *r, void *p_d, http_auth_info_t *ai);
@@ -57,28 +56,50 @@ static handler_t mod_authn_file_plain_digest(request_st *r, void *p_d, http_auth
 static handler_t mod_authn_file_plain_basic(request_st *r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 static handler_t mod_authn_file_htpasswd_basic(request_st *r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 
+INIT_FUNC(mod_authn_file_init);
+SETDEFAULTS_FUNC(mod_authn_file_set_defaults);
+
+static const plugin mod_authn_file_plugin = {
+  .name                         = "authn_file",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_authn_file_init,
+  .set_defaults                 = mod_authn_file_set_defaults
+};
+
 INIT_FUNC(mod_authn_file_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_authn_file_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_auth_backend_t http_auth_backend_htdigest =
       { "htdigest", mod_authn_file_htdigest_basic, mod_authn_file_htdigest_digest, NULL };
     static http_auth_backend_t http_auth_backend_htpasswd =
       { "htpasswd", mod_authn_file_htpasswd_basic, NULL, NULL };
     static http_auth_backend_t http_auth_backend_plain =
       { "plain", mod_authn_file_plain_basic, mod_authn_file_plain_digest, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_backend_htdigest */
-    http_auth_backend_htdigest.p_d = p;
+    http_auth_backend_htdigest.p_d = pd;
     http_auth_backend_set(&http_auth_backend_htdigest);
 
     /* register http_auth_backend_htpasswd */
-    http_auth_backend_htpasswd.p_d = p;
+    http_auth_backend_htpasswd.p_d = pd;
     http_auth_backend_set(&http_auth_backend_htpasswd);
 
     /* register http_auth_backend_plain */
-    http_auth_backend_plain.p_d = p;
+    http_auth_backend_plain.p_d = pd;
     http_auth_backend_set(&http_auth_backend_plain);
 
-    return p;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_authn_file_plugin_init(plugin *p);
+int mod_authn_file_plugin_init(plugin *p) {
+    memcpy(p, &mod_authn_file_plugin, sizeof(plugin));
+    return 0;
 }
 
 static void mod_authn_file_merge_config_cpv(plugin_config * const pconf, const config_plugin_value_t * const cpv) {
@@ -106,12 +127,12 @@ static void mod_authn_file_merge_config(plugin_config * const pconf, const confi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_authn_file_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_authn_file_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_authn_file_merge_config(&p->conf,
+            mod_authn_file_merge_config(pconf,
                                         p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
@@ -204,7 +225,7 @@ static int mod_authn_file_htdigest_get_loop(const char *data, const buffer *auth
         /* (last line might not end in '\n') */
         if (NULL == n) n = f_user + strlen(f_user);
 
-        char *f_pwd, *f_realm;
+        const char *f_pwd, *f_realm;
         size_t u_len, r_len;
 
         /* skip blank lines and comment lines (beginning '#') */
@@ -282,9 +303,9 @@ static int mod_authn_file_htdigest_get_loop(const char *data, const buffer *auth
 }
 
 static int mod_authn_file_htdigest_get(request_st * const r, void *p_d, http_auth_info_t * const ai) {
-    plugin_data *p = (plugin_data *)p_d;
-    mod_authn_file_patch_config(r, p);
-    const buffer * const auth_fn = p->conf.auth_htdigest_userfile;
+    plugin_config pconf;
+    mod_authn_file_patch_config(r, p_d, &pconf);
+    const buffer * const auth_fn = pconf.auth_htdigest_userfile;
     if (!auth_fn) return -1;
 
     off_t dlen = 64*1024*1024;/*(arbitrary limit: 64 MB file; expect < 1 MB)*/
@@ -352,7 +373,7 @@ static int mod_authn_file_htpasswd_get(const buffer *auth_fn, const char *userna
         /* (last line might not end in '\n') */
         if (NULL == n) n = f_user + strlen(f_user);
 
-        char *f_pwd;
+        const char *f_pwd;
         size_t u_len;
 
         /* skip blank lines and comment lines (beginning '#') */
@@ -397,10 +418,10 @@ static int mod_authn_file_htpasswd_get(const buffer *auth_fn, const char *userna
 }
 
 static handler_t mod_authn_file_plain_digest(request_st * const r, void *p_d, http_auth_info_t * const ai) {
-    plugin_data *p = (plugin_data *)p_d;
-    mod_authn_file_patch_config(r, p);
+    plugin_config pconf;
+    mod_authn_file_patch_config(r, p_d, &pconf);
     buffer * const tb = r->tmp_buf; /* password-string from auth-backend */
-    int rc = mod_authn_file_htpasswd_get(p->conf.auth_plain_userfile,
+    int rc = mod_authn_file_htpasswd_get(pconf.auth_plain_userfile,
                                          ai->username, ai->ulen, tb,
                                          r->conf.errh);
     if (0 != rc) return HANDLER_ERROR;
@@ -414,10 +435,10 @@ static handler_t mod_authn_file_plain_digest(request_st * const r, void *p_d, ht
 }
 
 static handler_t mod_authn_file_plain_basic(request_st * const r, void *p_d, const http_auth_require_t * const require, const buffer * const username, const char * const pw) {
-    plugin_data *p = (plugin_data *)p_d;
-    mod_authn_file_patch_config(r, p);
+    plugin_config pconf;
+    mod_authn_file_patch_config(r, p_d, &pconf);
     buffer * const tb = r->tmp_buf; /* password-string from auth-backend */
-    int rc = mod_authn_file_htpasswd_get(p->conf.auth_plain_userfile,
+    int rc = mod_authn_file_htpasswd_get(pconf.auth_plain_userfile,
                                          BUF_PTR_LEN(username), tb,
                                          r->conf.errh);
     if (0 == rc) {
@@ -695,10 +716,10 @@ static int mod_authn_file_crypt_cmp(const buffer * const password, const char * 
 #endif
 
 static handler_t mod_authn_file_htpasswd_basic(request_st * const r, void *p_d, const http_auth_require_t * const require, const buffer * const username, const char * const pw) {
-    plugin_data *p = (plugin_data *)p_d;
-    mod_authn_file_patch_config(r, p);
+    plugin_config pconf;
+    mod_authn_file_patch_config(r, p_d, &pconf);
     buffer * const tb = r->tmp_buf; /* password-string from auth-backend */
-    int rc = mod_authn_file_htpasswd_get(p->conf.auth_htpasswd_userfile,
+    int rc = mod_authn_file_htpasswd_get(pconf.auth_htpasswd_userfile,
                                          BUF_PTR_LEN(username), tb,
                                          r->conf.errh);
     if (0 != rc) return HANDLER_ERROR;
@@ -737,17 +758,4 @@ static handler_t mod_authn_file_htpasswd_basic(request_st * const r, void *p_d, 
     return 0 == rc && http_auth_match_rules(require, username->ptr, NULL, NULL)
       ? HANDLER_GO_ON
       : HANDLER_ERROR;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_authn_file_plugin_init(plugin *p);
-int mod_authn_file_plugin_init(plugin *p) {
-    p->version     = LIGHTTPD_VERSION_ID;
-    p->name        = "authn_file";
-    p->init        = mod_authn_file_init;
-    p->set_defaults= mod_authn_file_set_defaults;
-
-    return 0;
 }

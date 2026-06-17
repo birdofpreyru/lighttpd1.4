@@ -22,6 +22,7 @@
 #include "fdevent.h"    /* FDEVENT_STREAM_REQUEST_BUFMIN */
 #include "http_date.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "log.h"
 #include "request.h"
 #include "response.h"   /* http_dispatch[] http_response_omit_header() */
@@ -63,6 +64,7 @@ static const char http_header_lc[][32] = {
  ,[HTTP_HEADER_IF_NONE_MATCH]             = "if-none-match"
  ,[HTTP_HEADER_IF_RANGE]                  = "if-range"
  ,[HTTP_HEADER_IF_UNMODIFIED_SINCE]       = "if-unmodified-since"
+ ,[HTTP_HEADER_INCREMENTAL]               = "incremental"
  ,[HTTP_HEADER_LAST_MODIFIED]             = "last-modified"
  ,[HTTP_HEADER_LINK]                      = "link"
  ,[HTTP_HEADER_LOCATION]                  = "location"
@@ -161,6 +163,7 @@ static const uint8_t http_header_lshpack_idx[] = {
  ,[HTTP_HEADER_X_CONTENT_TYPE_OPTIONS]    = LSHPACK_HDR_UNKNOWN
  ,[HTTP_HEADER_X_FRAME_OPTIONS]           = LSHPACK_HDR_UNKNOWN
  ,[HTTP_HEADER_X_XSS_PROTECTION]          = LSHPACK_HDR_UNKNOWN
+ ,[HTTP_HEADER_INCREMENTAL]               = LSHPACK_HDR_UNKNOWN
 };
 
 
@@ -1185,7 +1188,7 @@ h2_recv_data (connection * const con, const uint8_t * const s, const uint32_t le
     uint32_t alen = len; /* actual data len, minus padding */
     uint32_t pad = 0;
     if (s[4] & H2_FLAG_PADDED) {
-        pad = s[9];
+        pad = s[9]; /*(reads '\0' after string if 0 == len)*/
         if (pad >= len) {
             h2_send_goaway_e(con, H2_E_PROTOCOL_ERROR);
             return 0;
@@ -1260,7 +1263,7 @@ h2_recv_data (connection * const con, const uint8_t * const s, const uint32_t le
     /*h2_send_window_update_unit(con,r,len);*//*(r->x.h2.rwin)*//*(see below)*/
 
     /* avoid sending small WINDOW_UPDATE frames
-     * Pre-emptively increase window size up to 16k (default max frame size)
+     * Preemptively increase window size up to 16k (default max frame size)
      * and then defer small window updates until the excess is utilized. */
     h2_send_window_update_unit(con, h2r, len); /*(h2r->x.h2.rwin)*/
 
@@ -1303,12 +1306,11 @@ h2_recv_data (connection * const con, const uint8_t * const s, const uint32_t le
         if (__builtin_expect( (n >= 0), 1)) /*(force wupd below w/ +16384)*/
             wupd=n>=rwin ? (n-=rwin)>(int32_t)len ? len : (uint32_t)n+16384 : 0;
         else if (-n > 65536 || 0 == r->http_status) {
-            if (0 == r->http_status) {
-                r->http_status = 413; /* Payload Too Large */
-                r->handler_module = NULL;
+            if (!http_status_is_set(r)) {
                 log_error(r->conf.errh, __FILE__, __LINE__,
                   "request-size too long: %lld -> 413",
                   (long long) (dst->bytes_in + (off_t)alen));
+                http_status_set_err(r, 413); /* Payload Too Large */
             }
             else { /* if (-n > 65536) */
                 /* tolerate up to 64k additional data before resetting stream
@@ -1329,7 +1331,7 @@ h2_recv_data (connection * const con, const uint8_t * const s, const uint32_t le
     /*r->x.h2.rwin -= (int32_t)len;*/
     /*r->x.h2.rwin += (int32_t)wupd;*/
     /* avoid sending small WINDOW_UPDATE frames
-     * Pre-emptively increase window size up to 16k (default max frame size)
+     * Preemptively increase window size up to 16k (default max frame size)
      * and then defer small window updates until the excess is utilized.
      * This aims to reduce degenerative behavior from clients sending an
      * increasing number of tiny DATA frames. */
@@ -1866,7 +1868,7 @@ h2_recv_headers (connection * const con, uint8_t * const s, uint32_t flen)
     uint32_t alen = flen;
     if (s[4] & H2_FLAG_PADDED) {
         ++psrc;
-        const uint32_t pad = s[9];
+        const uint32_t pad = s[9]; /*(reads '\0' after string if 0 == alen)*/
         if (alen < 1 + pad) {
             /* Padding that exceeds the size remaining for the header block
              * fragment MUST be treated as a PROTOCOL_ERROR. */
@@ -2431,7 +2433,7 @@ h2_send_hpack (request_st * const r, connection * const con, const char *data, u
      * with slight over-estimate of 16 bytes per frame header (> 9)
      * and minimum SETTING_MAX_FRAME_SIZE of 16k (could be larger)
      * (dlen >> 14)+1 is num 16k frames needed, multiplied by 16 bytes
-     *  per frame can be appoximated with (dlen>>10) + 9)*/
+     *  per frame can be approximated with (dlen>>10) + 9)*/
     buffer * const b =
       chunkqueue_append_buffer_open_sz(con->write_queue, dlen + (dlen>>10) + 9);
     char * restrict ptr = b->ptr;
@@ -3031,7 +3033,7 @@ h2_send_data (request_st * const r, connection * const con, const char *data, ui
      * with slight over-estimate of 16 bytes per frame header (> 9)
      * and minimum SETTING_MAX_FRAME_SIZE of 16k (could be larger)
      * (dlen >> 14)+1 is num 16k frames needed, multiplied by 16 bytes
-     *  per frame can be appoximated with (dlen>>10) + 9)*/
+     *  per frame can be approximated with (dlen>>10) + 9)*/
     buffer * const b =
       chunkqueue_append_buffer_open_sz(con->write_queue, dlen + (dlen>>10) + 9);
     char * restrict ptr = b->ptr;
@@ -3214,7 +3216,7 @@ static void
 h2_send_end_stream (request_st * const r, connection * const con)
 {
     if (r->x.h2.state == H2_STATE_CLOSED) return;
-    if (r->state != CON_STATE_ERROR && r->resp_body_finished) {
+    if (r->state != CON_STATE_ERROR && r->resp_body_finished == 1) {
         /* CON_STATE_RESPONSE_END */
         buffer *b;
         char *t;
@@ -3382,9 +3384,31 @@ h2_retire_con (request_st * const h2r, connection * const con)
 }
 
 
+__attribute_cold__
+__attribute_nonnull__()
 static void
-h2_con_upgrade_h2c (request_st * const h2r, connection * const con)
+h2_upgrade_h2c (request_st * const h2r, connection * const con)
 {
+    /* Upgrade: h2c
+     * RFC7540 3.2 Starting HTTP/2 for "http" URIs */
+
+    buffer * const http2_settings =
+      http_header_request_get(h2r, HTTP_HEADER_HTTP2_SETTINGS,
+                              CONST_STR_LEN("HTTP2-Settings"));
+
+    /* ignore Upgrade: h2c if request body present since we do not
+     * (currently) handle request body before transition to h2c */
+    /* RFC7540 3.2 Requests that contain a payload body MUST be sent
+     * in their entirety before the client can send HTTP/2 frames. */
+
+    if (NULL != http2_settings
+        && 0 == h2r->reqbody_length
+        && h2r->conf.h2proto > 1 /*(must be enabled with server.h2c feature)*/
+        && !con->is_ssl_sock)    /*(disallow h2c over TLS socket)*/
+        h2r->http_version = HTTP_VERSION_2;
+    else
+        return;
+
     /* HTTP/1.1 101 Switching Protocols
      * Connection: Upgrade
      * Upgrade: h2c
@@ -3410,6 +3434,15 @@ h2_con_upgrade_h2c (request_st * const h2r, connection * const con)
 
     ((h2con *)con->hx)->h2_cid = 1; /* stream id 1 is assigned to h2c upgrade */
 
+    buffer * const tb = h2r->tmp_buf;
+    buffer_clear(tb);
+    if (buffer_append_base64_decode(tb,BUF_PTR_LEN(http2_settings),BASE64_URL))
+        h2_parse_frame_settings(con, (uint8_t *)BUF_PTR_LEN(tb));
+    else {
+        h2_send_goaway_e(con, H2_E_PROTOCOL_ERROR);
+        return;
+    }
+
     /* copy request state from &con->request to subrequest r
      * XXX: would be nice if there were a cleaner way to do this
      * (This is fragile and must be kept in-sync with request_st in request.h)*/
@@ -3417,7 +3450,7 @@ h2_con_upgrade_h2c (request_st * const h2r, connection * const con)
     request_st * const r = h2_init_stream(h2r, con);
     /*(undo double-count; already incremented in CON_STATE_REQUEST_START)*/
     --con->request_count;
-    r->state = CON_STATE_WRITE; /* require 0 == r->reqbody_length */
+    r->state = CON_STATE_HANDLE_REQUEST; /* require 0 == r->reqbody_length */
     r->http_status = 0;
     r->http_method = h2r->http_method;
     r->x.h2.state = H2_STATE_HALF_CLOSED_REMOTE;
@@ -3472,52 +3505,26 @@ h2_con_upgrade_h2c (request_st * const h2r, connection * const con)
   #endif
   #if 0
     r->loops_per_request = h2r->loops_per_request;
-    r->async_callback = h2r->async_callback;
   #endif
     r->keep_alive = h2r->keep_alive;
     r->tmp_buf = h2r->tmp_buf;                /* shared; same as srv->tmp_buf */
     r->start_hp = h2r->start_hp;                /* copy struct */
 
+    http_header_request_unset(r, HTTP_HEADER_HTTP2_SETTINGS,
+                              CONST_STR_LEN("HTTP2-Settings"));
+    http_header_request_unset(r, HTTP_HEADER_UPGRADE,
+                              CONST_STR_LEN("Upgrade"));
+    buffer * const http_connection =
+      http_header_request_get(r, HTTP_HEADER_CONNECTION,
+                              CONST_STR_LEN("Connection"));
+    if (!http_connection) return; /*(already checked in h1_check_upgrade())*/
+    http_header_remove_token(http_connection, CONST_STR_LEN("HTTP2-Settings"));
+    http_header_remove_token(http_connection, CONST_STR_LEN("Upgrade"));
+
     /* Note: HTTP/1.1 101 Switching Protocols is not immediately written to
      * the network here.  As this is called from cleartext Upgrade: h2c,
      * we choose to delay sending the status until the beginning of the response
      * to the HTTP/1.1 request which included Upgrade: h2c */
-}
-
-
-__attribute_cold__
-__attribute_nonnull__()
-static void
-h2_upgrade_h2c (request_st * const r, connection * const con)
-{
-    /* Upgrade: h2c
-     * RFC7540 3.2 Starting HTTP/2 for "http" URIs */
-
-    buffer * const http2_settings =
-      http_header_request_get(r, HTTP_HEADER_HTTP2_SETTINGS,
-                              CONST_STR_LEN("HTTP2-Settings"));
-
-    /* ignore Upgrade: h2c if request body present since we do not
-     * (currently) handle request body before transition to h2c */
-    /* RFC7540 3.2 Requests that contain a payload body MUST be sent
-     * in their entirety before the client can send HTTP/2 frames. */
-
-    if (NULL != http2_settings
-        && 0 == r->reqbody_length
-        && r->conf.h2proto > 1/*(must be enabled with server.h2c feature)*/
-        && !con->is_ssl_sock) { /*(disallow h2c over TLS socket)*/
-
-        r->http_version = HTTP_VERSION_2;
-        h2_con_upgrade_h2c(r, con);
-
-        buffer * const b = r->tmp_buf;
-        buffer_clear(b);
-        if (buffer_append_base64_decode(b, BUF_PTR_LEN(http2_settings),
-                                        BASE64_URL))
-            h2_parse_frame_settings(con, (uint8_t *)BUF_PTR_LEN(b));
-        else
-            h2_send_goaway_e(con, H2_E_PROTOCOL_ERROR);
-    }
 }
 
 
@@ -3539,7 +3546,7 @@ h2_send_goaway_delayed (connection * const con)
 }
 
 
-#include "plugin.h"     /* const plugin * const p = r->handler_module; */
+#include "plugin.h"     /* plugin_data_base * const pd = r->handler_module; */
 
 static int
 h2_process_streams (connection * const con,
@@ -3621,8 +3628,8 @@ h2_process_streams (connection * const con,
                 /* specialized connection_handle_write_state() */
 
                 if (r->handler_module && !r->resp_body_finished) {
-                    const plugin * const p = r->handler_module;
-                    if (p->handle_subrequest(r, p->data)
+                    plugin_data_base * const pd = r->handler_module;
+                    if (pd->self->handle_subrequest(r, pd)
                         > HANDLER_WAIT_FOR_EVENT) {
                       /*case HANDLER_COMEBACK:*//*error after send resp hdrs*/
                       /*case HANDLER_ERROR:*/
@@ -3850,9 +3857,19 @@ typedef struct {
     PLUGIN_DATA;
 } plugin_data;
 
+INIT_FUNC(mod_h2_init);
+
+static const plugin mod_h2_plugin = {
+  .name                         = "h2",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_h2_init
+};
+
 INIT_FUNC(mod_h2_init) {
     http_dispatch[HTTP_VERSION_2] = h2_dispatch_table; /* copy struct */
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_h2_plugin;
+    return pd;
 }
 
 
@@ -3860,8 +3877,6 @@ __attribute_cold__
 __declspec_dllexport__
 int mod_h2_plugin_init (plugin *p);
 int mod_h2_plugin_init (plugin *p) {
-    p->version     = LIGHTTPD_VERSION_ID;
-    p->name        = "h2";
-    p->init        = mod_h2_init;
+    memcpy(p, &mod_h2_plugin, sizeof(plugin));
     return 0;
 }

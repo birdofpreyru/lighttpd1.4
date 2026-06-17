@@ -11,6 +11,7 @@
 
 #include "mod_vhostdb_api.h"
 #include "base.h"
+#include "http_status.h"
 #include "plugin.h"
 #include "plugin_config.h"
 #include "log.h"
@@ -34,7 +35,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 typedef struct {
@@ -95,10 +95,10 @@ vhostdb_cache_init (const array *opts)
 }
 
 static vhostdb_cache_entry *
-mod_vhostdb_cache_query (request_st * const r, plugin_data * const p)
+mod_vhostdb_cache_query (request_st * const r, plugin_config * const pconf)
 {
     const int ndx = splaytree_djbhash(BUF_PTR_LEN(&r->uri.authority));
-    splay_tree ** const sptree = &p->conf.vhostdb_cache->sptree;
+    splay_tree ** const sptree = &pconf->vhostdb_cache->sptree;
     *sptree = splaytree_splay(*sptree, ndx);
     vhostdb_cache_entry * const ve =
       (*sptree && (*sptree)->key == ndx) ? (*sptree)->data : NULL;
@@ -110,10 +110,10 @@ mod_vhostdb_cache_query (request_st * const r, plugin_data * const p)
 }
 
 static void
-mod_vhostdb_cache_insert (request_st * const r, plugin_data * const p, vhostdb_cache_entry * const ve)
+mod_vhostdb_cache_insert (request_st * const r, plugin_config * const pconf, vhostdb_cache_entry * const ve)
 {
     const int ndx = splaytree_djbhash(BUF_PTR_LEN(&r->uri.authority));
-    splay_tree ** const sptree = &p->conf.vhostdb_cache->sptree;
+    splay_tree ** const sptree = &pconf->vhostdb_cache->sptree;
     /*(not necessary to re-splay (with current usage) since single-threaded
      * and splaytree has not been modified since mod_vhostdb_cache_query())*/
     /* *sptree = splaytree_splay(*sptree, ndx); */
@@ -125,8 +125,36 @@ mod_vhostdb_cache_insert (request_st * const r, plugin_data * const p, vhostdb_c
     }
 }
 
+INIT_FUNC(mod_vhostdb_init);
+FREE_FUNC(mod_vhostdb_free);
+SETDEFAULTS_FUNC(mod_vhostdb_set_defaults);
+REQUEST_FUNC(mod_vhostdb_handle_docroot);
+REQUEST_FUNC(mod_vhostdb_handle_request_reset);
+TRIGGER_FUNC(mod_vhostdb_periodic);
+
+static const plugin mod_vhostdb_plugin = {
+  .name                         = "vhostdb",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_vhostdb_init,
+  .cleanup                      = mod_vhostdb_free,
+  .set_defaults                 = mod_vhostdb_set_defaults,
+  .handle_docroot               = mod_vhostdb_handle_docroot,
+  .handle_request_reset         = mod_vhostdb_handle_request_reset,
+  .handle_trigger               = mod_vhostdb_periodic
+};
+
 INIT_FUNC(mod_vhostdb_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_vhostdb_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_vhostdb_plugin_init(plugin *p);
+int mod_vhostdb_plugin_init(plugin *p) {
+    memcpy(p, &mod_vhostdb_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_vhostdb_free) {
@@ -172,11 +200,11 @@ static void mod_vhostdb_merge_config(plugin_config * const pconf, const config_p
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_vhostdb_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_vhostdb_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_vhostdb_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_vhostdb_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -250,9 +278,7 @@ REQUEST_FUNC(mod_vhostdb_handle_request_reset) {
 __attribute_cold__
 static handler_t mod_vhostdb_error_500 (request_st * const r)
 {
-    r->http_status = 500; /* Internal Server Error */
-    r->handler_module = NULL;
-    return HANDLER_FINISHED;
+    return http_status_set_err(r, 500); /* Internal Server Error */
 }
 
 static handler_t mod_vhostdb_found (request_st * const r, vhostdb_cache_entry * const ve)
@@ -267,7 +293,7 @@ static handler_t mod_vhostdb_found (request_st * const r, vhostdb_cache_entry * 
 }
 
 REQUEST_FUNC(mod_vhostdb_handle_docroot) {
-    plugin_data *p = p_d;
+    const plugin_data * const p = p_d;
     vhostdb_cache_entry *ve;
 
     /* no host specified? */
@@ -279,14 +305,15 @@ REQUEST_FUNC(mod_vhostdb_handle_docroot) {
         && buffer_is_equal_string(&r->uri.authority, ve->server_name, ve->slen))
         return mod_vhostdb_found(r, ve); /* HANDLER_GO_ON */
 
-    mod_vhostdb_patch_config(r, p);
-    if (!p->conf.vhostdb_backend) return HANDLER_GO_ON;
+    plugin_config pconf;
+    mod_vhostdb_patch_config(r, p, &pconf);
+    if (!pconf.vhostdb_backend) return HANDLER_GO_ON;
 
-    if (p->conf.vhostdb_cache && (ve = mod_vhostdb_cache_query(r, p)))
+    if (pconf.vhostdb_cache && (ve = mod_vhostdb_cache_query(r, &pconf)))
         return mod_vhostdb_found(r, ve); /* HANDLER_GO_ON */
 
     buffer * const b = r->tmp_buf; /*(cleared before use in backend->query())*/
-    const http_vhostdb_backend_t * const backend = p->conf.vhostdb_backend;
+    const http_vhostdb_backend_t * const backend = pconf.vhostdb_backend;
     if (0 != backend->query(r, backend->p_d, b)) {
         return mod_vhostdb_error_500(r); /* HANDLER_FINISHED */
     }
@@ -303,15 +330,15 @@ REQUEST_FUNC(mod_vhostdb_handle_docroot) {
         return mod_vhostdb_error_500(r); /* HANDLER_FINISHED */
     }
 
-    if (ve && !p->conf.vhostdb_cache)
+    if (ve && !pconf.vhostdb_cache)
         vhostdb_cache_entry_free(ve);
 
     ve = vhostdb_cache_entry_init(&r->uri.authority, b);
 
-    if (!p->conf.vhostdb_cache)
+    if (!pconf.vhostdb_cache)
         r->plugin_ctx[p->id] = ve;
     else
-        mod_vhostdb_cache_insert(r, p, ve);
+        mod_vhostdb_cache_insert(r, &pconf, ve);
 
     return mod_vhostdb_found(r, ve); /* HANDLER_GO_ON */
 }
@@ -374,21 +401,4 @@ TRIGGER_FUNC(mod_vhostdb_periodic)
     }
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_vhostdb_plugin_init(plugin *p);
-int mod_vhostdb_plugin_init(plugin *p) {
-    p->version          = LIGHTTPD_VERSION_ID;
-    p->name             = "vhostdb";
-    p->init             = mod_vhostdb_init;
-    p->cleanup          = mod_vhostdb_free;
-    p->set_defaults     = mod_vhostdb_set_defaults;
-    p->handle_trigger   = mod_vhostdb_periodic;
-    p->handle_docroot   = mod_vhostdb_handle_docroot;
-    p->handle_request_reset = mod_vhostdb_handle_request_reset;
-
-    return 0;
 }

@@ -10,6 +10,7 @@
 #include "fdevent.h"
 #include "http_kv.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "log.h"
 #include "sock_addr.h"
 
@@ -26,6 +27,8 @@ typedef struct http_header_remap_opts {
     const array *urlpaths;
     const array *hosts_request;
     const array *hosts_response;
+    const array *urlpath_resp_host_include;
+    const array *urlpath_resp_host_exclude;
     int force_http10;
     int https_remap;
     int upgrade;
@@ -54,8 +57,7 @@ typedef struct {
 
 typedef struct {
     PLUGIN_DATA;
-    pid_t srv_pid; /* must match layout of gw_plugin_data through conf member */
-    plugin_config conf;
+    pid_t srv_pid; /* must match layout of gw_plugin_data to defaults member */
     plugin_config defaults;
 } plugin_data;
 
@@ -67,8 +69,38 @@ typedef struct {
 } handler_ctx;
 
 
+INIT_FUNC(mod_proxy_init);
+FREE_FUNC(mod_proxy_free);
+SETDEFAULTS_FUNC(mod_proxy_set_defaults);
+REQUEST_FUNC(mod_proxy_check_extension);
+
+static const plugin mod_proxy_plugin = {
+  .name                         = "proxy",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_proxy_init,
+  .cleanup                      = mod_proxy_free,
+  .set_defaults                 = mod_proxy_set_defaults,
+  .handle_uri_clean             = mod_proxy_check_extension,
+  .handle_subrequest            = gw_handle_subrequest,
+  .handle_request_reset         = gw_handle_request_reset,
+  .handle_trigger               = gw_handle_trigger,
+  .handle_waitpid               = gw_handle_waitpid_cb
+};
+
+
 INIT_FUNC(mod_proxy_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_proxy_plugin;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_proxy_plugin_init(plugin *p);
+int mod_proxy_plugin_init(plugin *p) {
+    memcpy(p, &mod_proxy_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -144,12 +176,12 @@ static void mod_proxy_merge_config(plugin_config * const pconf, const config_plu
 }
 
 
-static void mod_proxy_patch_config(request_st * const r, plugin_data * const p)
+static void mod_proxy_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf)
 {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_proxy_merge_config(&p->conf, p->cvlist+p->cvlist[i].v.u2[0]);
+            mod_proxy_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -196,73 +228,65 @@ static http_header_remap_opts * mod_proxy_parse_header_opts(server *srv, const a
     memset(&header, 0, sizeof(header));
     for (uint32_t j = 0, used = a->used; j < used; ++j) {
         data_array *da = (data_array *)a->data[j];
-        if (buffer_eq_slen(&da->key, CONST_STR_LEN("https-remap"))) {
+        int *bval = NULL;
+        if (buffer_eq_slen(&da->key, CONST_STR_LEN("https-remap")))
+            bval = &header.https_remap;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("force-http10")))
+            bval = &header.force_http10;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("upgrade")))
+            bval = &header.upgrade;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("connect")))
+            bval = &header.connect_method;
+        if (bval) {
             int val = config_plugin_value_to_bool((data_unset *)da, 2);
             if (2 == val) {
                 log_error(srv->errh, __FILE__, __LINE__,
                   "unexpected value for proxy.header; "
-                  "expected \"https-remap\" => \"enable\" or \"disable\"");
+                  "expected \"%s\" => \"enable\" or \"disable\"", da->key.ptr);
                 return NULL;
             }
-            header.https_remap = val;
+            *bval = val;
             continue;
         }
-        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("force-http10"))) {
-            int val = config_plugin_value_to_bool((data_unset *)da, 2);
-            if (2 == val) {
+
+        const array **aval = NULL;
+        if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-urlpath")))
+            aval = &header.urlpaths;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-host-request")))
+            aval = &header.hosts_request;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-host-response")))
+            aval = &header.hosts_response;
+        if (aval) {
+            if (da->type != TYPE_ARRAY || !array_is_kvstring(&da->value)) {
                 log_error(srv->errh, __FILE__, __LINE__,
                   "unexpected value for proxy.header; "
-                  "expected \"force-http10\" => \"enable\" or \"disable\"");
+                  "expected ( \"%s\" => ( \"key\" => \"value\" ) )",
+                  da->key.ptr);
                 return NULL;
             }
-            header.force_http10 = val;
+            *aval = &da->value;
             continue;
         }
-        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("upgrade"))) {
-            int val = config_plugin_value_to_bool((data_unset *)da, 2);
-            if (2 == val) {
+
+        if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-urlpath-resp-host-include")))
+            aval = &header.urlpath_resp_host_include;
+        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-urlpath-resp-host-exclude")))
+            aval = &header.urlpath_resp_host_exclude;
+        if (aval) {
+            if (da->type != TYPE_ARRAY || !array_is_vlist(&da->value)) {
                 log_error(srv->errh, __FILE__, __LINE__,
                   "unexpected value for proxy.header; "
-                  "expected \"upgrade\" => \"enable\" or \"disable\"");
+                  "expected ( \"%s\" => ( \"list\" )",
+                  da->key.ptr);
                 return NULL;
             }
-            header.upgrade = val;
+            *aval = &da->value;
             continue;
         }
-        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("connect"))) {
-            int val = config_plugin_value_to_bool((data_unset *)da, 2);
-            if (2 == val) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "unexpected value for proxy.header; "
-                  "expected \"connect\" => \"enable\" or \"disable\"");
-                return NULL;
-            }
-            header.connect_method = val;
-            continue;
-        }
-        if (da->type != TYPE_ARRAY || !array_is_kvstring(&da->value)) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "unexpected value for proxy.header; "
-              "expected ( \"param\" => ( \"key\" => \"value\" ) ) near key %s",
-              da->key.ptr);
-            return NULL;
-        }
-        if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-urlpath"))) {
-            header.urlpaths = &da->value;
-        }
-        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-host-request"))) {
-            header.hosts_request = &da->value;
-        }
-        else if (buffer_eq_slen(&da->key, CONST_STR_LEN("map-host-response"))) {
-            header.hosts_response = &da->value;
-        }
-        else {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "unexpected key for proxy.header; "
-              "expected ( \"param\" => ( \"key\" => \"value\" ) ) near key %s",
-              da->key.ptr);
-            return NULL;
-        }
+
+        log_error(srv->errh, __FILE__, __LINE__,
+          "unexpected key for proxy.header: %s", da->key.ptr);
+        return NULL;
     }
 
     http_header_remap_opts *opts = ck_malloc(sizeof(header));
@@ -527,6 +551,18 @@ static void http_header_remap_uri (buffer *b, size_t off, http_header_remap_opts
             buffer_substr_replace(b, off, alen, m);
             alen = buffer_clen(m);/*(length of replacement authority)*/
         }
+
+        if (!is_req) {
+            /* if include list defined, remap if authority match, else exclude*/
+            const array *list = remap_hdrs->urlpath_resp_host_include;
+            if (list && !array_get_element_klen(list, b->ptr+off, alen))
+                return;
+            /* if exclude list defined, do not remap if authority matches */
+            list = remap_hdrs->urlpath_resp_host_exclude;
+            if (list && array_get_element_klen(list, b->ptr+off, alen))
+                return;
+        }
+
         off += alen;
     }
 
@@ -800,7 +836,7 @@ static handler_t proxy_stdin_append(gw_handler_ctx *hctx) {
     /*handler_ctx *hctx = (handler_ctx *)gwhctx;*/
     chunkqueue * const req_cq = &hctx->r->reqbody_queue;
     const off_t req_cqlen = chunkqueue_length(req_cq);
-    if (req_cqlen) {
+    if (req_cqlen && chunkqueue_length(&hctx->wb) < 65536) {
         /* XXX: future: use http_chunk_len_append() */
         buffer * const tb = hctx->r->tmp_buf;
         buffer_clear(tb);
@@ -1118,26 +1154,27 @@ static handler_t proxy_response_headers(request_st * const r, struct http_respon
 }
 
 static handler_t mod_proxy_check_extension(request_st * const r, void *p_d) {
-	plugin_data *p = p_d;
-	handler_t rc;
-
 	if (NULL != r->handler_module) return HANDLER_GO_ON;
 
-	mod_proxy_patch_config(r, p);
-	if (NULL == p->conf.gw.exts) return HANDLER_GO_ON;
+	plugin_config pconf;
+	mod_proxy_patch_config(r, p_d, &pconf);
+	if (NULL == pconf.gw.exts) return HANDLER_GO_ON;
 
-	rc = gw_check_extension(r, (gw_plugin_data *)p, 1, sizeof(handler_ctx));
+	handler_t rc =
+	  gw_check_extension(r, (gw_plugin_config *)&pconf,
+	                     p_d, 1, sizeof(handler_ctx));
 	if (HANDLER_GO_ON != rc) return rc;
 
-	if (r->handler_module == p->self) {
-		handler_ctx *hctx = r->plugin_ctx[p->id];
+	const plugin_data_base * const pd = p_d;
+	if (r->handler_module == pd) {
+		handler_ctx *hctx = r->plugin_ctx[pd->id];
 		hctx->gw.create_env = proxy_create_env;
 		hctx->gw.response = chunk_buffer_acquire();
 		hctx->gw.opts.backend = BACKEND_PROXY;
 		hctx->gw.opts.pdata = hctx;
 		hctx->gw.opts.headers = proxy_response_headers;
 
-		hctx->conf = p->conf; /*(copies struct)*/
+		memcpy(&hctx->conf, &pconf, sizeof(plugin_config));
 		hctx->conf.header.http_host = r->http_host;
 		/* mod_proxy currently sends all backend requests as http.
 		 * https-remap is a flag since it might not be needed if backend
@@ -1161,32 +1198,10 @@ static handler_t mod_proxy_check_extension(request_st * const r, void *p_d) {
 				hctx->gw.create_env = proxy_create_env_connect;
 			}
 			else {
-				r->http_status = 405; /* Method Not Allowed */
-				r->handler_module = NULL;
-				return HANDLER_FINISHED;
+				return http_status_set_err(r, 405); /* Method Not Allowed */
 			}
 		}
 	}
 
 	return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_proxy_plugin_init(plugin *p);
-int mod_proxy_plugin_init(plugin *p) {
-	p->version      = LIGHTTPD_VERSION_ID;
-	p->name         = "proxy";
-
-	p->init         = mod_proxy_init;
-	p->cleanup      = mod_proxy_free;
-	p->set_defaults = mod_proxy_set_defaults;
-	p->handle_request_reset    = gw_handle_request_reset;
-	p->handle_uri_clean        = mod_proxy_check_extension;
-	p->handle_subrequest       = gw_handle_subrequest;
-	p->handle_trigger          = gw_handle_trigger;
-	p->handle_waitpid          = gw_handle_waitpid_cb;
-
-	return 0;
 }

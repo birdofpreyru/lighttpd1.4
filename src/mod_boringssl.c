@@ -254,8 +254,8 @@ typedef struct {
 
 static int ssl_is_init;
 /* need assigned p->id for deep access of module handler_ctx for connection
- *   i.e. handler_ctx *hctx = con->plugin_ctx[plugin_data_singleton->id]; */
-static plugin_data *plugin_data_singleton;
+ *   i.e. handler_ctx *hctx = con->plugin_ctx[mod_boringssl_plugin_data->id]; */
+static plugin_data *mod_boringssl_plugin_data;
 #define LOCAL_SEND_BUFSIZE (16 * 1024)
 static char *local_send_buffer;
 static int feature_refresh_certs;
@@ -547,7 +547,7 @@ mod_boringssl_pem_parse_certs_cb (void *cb_arg, struct iovec *vec, size_t nvec)
 {
     CRYPTO_BUFFER **certs;
     CRYPTO_BUFFER_POOL * const cbpool =
-      *(size_t *)cb_arg ? plugin_data_singleton->cbpool : NULL;
+      *(size_t *)cb_arg ? mod_boringssl_plugin_data->cbpool : NULL;
     /*(cb_arg overloaded as input flag for 'use_pool' or not)*/
 
     if (1 == nvec) { /* treat data as single DER */
@@ -841,8 +841,8 @@ mod_openssl_session_ticket_key_file (const char *fn)
      *    4-byte - activation timestamp
      *    4-byte - expiration timestamp
      *   16-byte - session ticket key name
-     *   32-byte - session ticket HMAC encrpytion key
-     *   32-byte - session ticket AES encrpytion key
+     *   32-byte - session ticket HMAC encryption key
+     *   32-byte - session ticket AES encryption key
      *
      * STEK file can be created with a command such as:
      *   dd if=/dev/random bs=1 count=80 status=none | \
@@ -909,7 +909,8 @@ static const buffer *
 mod_openssl_refresh_ech_key_is_ech_only(plugin_ssl_ctx * const s, const char * const h, size_t hlen)
 {
     /* (similar to mod_openssl_ech_only(), but without hctx) */
-    const array * const ech_only_hosts = plugin_data_singleton->ech_only_hosts;
+    const array * const ech_only_hosts =
+      mod_boringssl_plugin_data->ech_only_hosts;
     if (ech_only_hosts) {
         const data_unset *du = array_get_element_klen(ech_only_hosts, h, hlen);
         if (du) return &((const data_string *)du)->value;
@@ -1337,10 +1338,49 @@ mod_openssl_ech_only_policy_check (request_st * const r, handler_ctx * const hct
 #endif /* !OPENSSL_NO_ECH */
 
 
+INIT_FUNC(mod_openssl_init);
+FREE_FUNC(mod_openssl_free);
+SETDEFAULTS_FUNC(mod_openssl_set_defaults);
+CONNECTION_FUNC(mod_openssl_handle_con_accept);
+CONNECTION_FUNC(mod_openssl_handle_con_shut_wr);
+CONNECTION_FUNC(mod_openssl_handle_con_close);
+REQUEST_FUNC(mod_openssl_handle_uri_raw);
+REQUEST_FUNC(mod_openssl_handle_request_env);
+REQUEST_FUNC(mod_openssl_handle_request_reset);
+TRIGGER_FUNC(mod_openssl_handle_trigger);
+
+static const plugin mod_boringssl_plugin = {
+  .name                         = "openssl",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_openssl_init,
+  .cleanup                      = mod_openssl_free,
+  .priv_defaults                = mod_openssl_set_defaults,
+  .handle_connection_accept     = mod_openssl_handle_con_accept,
+  .handle_connection_shut_wr    = mod_openssl_handle_con_shut_wr,
+  .handle_connection_close      = mod_openssl_handle_con_close,
+  .handle_uri_raw               = mod_openssl_handle_uri_raw,
+  .handle_request_env           = mod_openssl_handle_request_env,
+  .handle_request_reset         = mod_openssl_handle_request_reset,
+  .handle_trigger               = mod_openssl_handle_trigger
+};
+
+
 INIT_FUNC(mod_openssl_init)
 {
-    plugin_data_singleton = (plugin_data *)ck_calloc(1, sizeof(plugin_data));
-    return plugin_data_singleton;
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_boringssl_plugin;
+    mod_boringssl_plugin_data = pd;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_boringssl_plugin_init (plugin *p);
+int mod_boringssl_plugin_init (plugin *p)
+{
+    memcpy(p, &mod_boringssl_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -1480,7 +1520,7 @@ mod_boringssl_load_cacerts_x509 (CRYPTO_BUFFER * const * const certs, size_t num
             /* insert into sk, preserving order from (CRYPTO_BUFFER *)certs
              * (admin might have preferred CA order for client cert selection)*/
             CRYPTO_BUFFER *subject =
-              CRYPTO_BUFFER_new(subj, len, plugin_data_singleton->cbpool);
+              CRYPTO_BUFFER_new(subj, len, mod_boringssl_plugin_data->cbpool);
             OPENSSL_free(subj);
             if (!subject || !sk_CRYPTO_BUFFER_push(names, subject)) {
                 CRYPTO_BUFFER_free(subject);
@@ -1623,7 +1663,7 @@ mod_openssl_merge_config(plugin_config * const pconf, const config_plugin_value_
 static void
 mod_openssl_patch_config (request_st * const r, plugin_config * const pconf)
 {
-    plugin_data * const p = plugin_data_singleton;
+    plugin_data * const p = mod_boringssl_plugin_data;
     memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
@@ -1633,7 +1673,7 @@ mod_openssl_patch_config (request_st * const r, plugin_config * const pconf)
 
 
 static int
-safer_X509_NAME_oneline(X509_NAME *name, char *buf, size_t sz)
+safer_X509_NAME_oneline(const X509_NAME *name, char *buf, size_t sz)
 {
     BIO *bio = BIO_new(BIO_s_mem());
     if (bio) {
@@ -1859,7 +1899,7 @@ app_verify_callback (X509_STORE_CTX *store_ctx, void *arg)
      * from ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain() to
      * X509_verify_cert(), but this intercepts and then turn around and call
      * X509_verify_cert().  This is an alternative to custom_verify_callback
-     * which repaces ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain()
+     * which replaces ssl/ssl_x509.cc:ssl_crypto_x509_session_verify_cert_chain
      * and results in custom_verify_callback having to replicate X509_STORE_CTX,
      * which is very complicated. */
     UNUSED(arg);
@@ -2309,7 +2349,8 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
         EVP_PKEY_free(ssl_pemfile_pkey);
         return NULL;
     }
-    if (!mod_boringssl_cert_is_active(ssl_pemfile_x509[0]))
+    if (!mod_boringssl_cert_is_active(ssl_pemfile_x509[0])
+        && log_epoch_secs > 300)
         log_error(srv->errh, __FILE__, __LINE__,
           "SSL: inactive/expired X509 certificate '%s'", pemfile->ptr);
 
@@ -2484,8 +2525,7 @@ mod_openssl_alpn_select_cb (SSL *ssl, const unsigned char **out, unsigned char *
             if (in[i] == 'h' && in[i+1] == '2') {
                 if (!hctx->r->conf.h2proto) continue;
                 proto = MOD_OPENSSL_ALPN_H2;
-                if (hctx->r->handler_module == NULL)/*(e.g. not mod_sockproxy)*/
-                    hctx->r->http_version = HTTP_VERSION_2;
+                hctx->r->http_version = HTTP_VERSION_2;
                 break;
             }
             continue;
@@ -2554,6 +2594,7 @@ static int
 mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *ssl_ec_curve)
 {
   #ifndef OPENSSL_NO_ECDH
+   #if !defined(SSL_GROUP_X25519_MLKEM768)
     /* boringssl eccurves_default[] (now kDefaultGroups[])
      * has been the equivalent of "X25519:secp256r1:secp384r1" since 2016
      * (previously with secp521r1 appended for Android)
@@ -2561,10 +2602,14 @@ mod_openssl_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *
      *  since mid 2014) */
     if (NULL == ssl_ec_curve || buffer_is_blank(ssl_ec_curve))
         return 1;
+   #endif
 
     const char *groups = ssl_ec_curve && !buffer_is_blank(ssl_ec_curve)
       ? ssl_ec_curve->ptr
       :
+       #if defined(SSL_GROUP_X25519_MLKEM768)
+        "X25519MLKEM768:"
+       #endif
         /* boringssl include/openssl/evp.h contains comment:
          * > EVP_PKEY_X448 is defined for OpenSSL compatibility, but we do not
          * > support X448 and attempts to create keys will fail.
@@ -3408,7 +3453,7 @@ mod_openssl_close_notify(handler_ctx *hctx);
 static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_boringssl_plugin_data->id];
 
     if (__builtin_expect( (0 != hctx->close_notify), 0))
         return mod_openssl_close_notify(hctx);
@@ -3470,7 +3515,7 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
 static int
 connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_boringssl_plugin_data->id];
     int len;
     char *mem = NULL;
     size_t mem_len = 0;
@@ -3782,7 +3827,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_close)
 
 
 static void
-https_add_ssl_client_subject (request_st * const r, X509_NAME *xn)
+https_add_ssl_client_subject (request_st * const r, const X509_NAME * const xn)
 {
     const size_t prelen = sizeof("SSL_CLIENT_S_DN_")-1;
     char key[64] = "SSL_CLIENT_S_DN_";
@@ -3849,7 +3894,7 @@ https_add_ssl_client_entries (request_st * const r, handler_ctx * const hctx)
   #endif
     if (!xs) return;
 
-    X509_NAME * const xn = X509_get_subject_name(xs);
+    const X509_NAME * const xn = X509_get_subject_name(xs);
     {
         char buf[256];
         int len = safer_X509_NAME_oneline(xn, buf, sizeof(buf));
@@ -3866,12 +3911,16 @@ https_add_ssl_client_entries (request_st * const r, handler_ctx * const hctx)
     {
         ASN1_INTEGER *xsn = X509_get_serialNumber(xs);
         BIGNUM *serialBN = ASN1_INTEGER_to_BN(xsn, NULL);
-        char *serialHex = BN_bn2hex(serialBN);
-        http_header_env_set(r,
-                            CONST_STR_LEN("SSL_CLIENT_M_SERIAL"),
-                            serialHex, strlen(serialHex));
-        OPENSSL_free(serialHex);
-        BN_free(serialBN);
+        if (serialBN) {
+            char *serialHex = BN_bn2hex(serialBN);
+            if (serialHex) {
+                http_header_env_set(r,
+                                    CONST_STR_LEN("SSL_CLIENT_M_SERIAL"),
+                                    serialHex, strlen(serialHex));
+                OPENSSL_free(serialHex);
+            }
+            BN_free(serialBN);
+        }
     }
 
     if (hctx->conf.ssl_verifyclient_username) {
@@ -4158,29 +4207,6 @@ TRIGGER_FUNC(mod_openssl_handle_trigger) {
         mod_openssl_refresh_crl_files(srv, p, cur_ts);
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_boringssl_plugin_init (plugin *p);
-int mod_boringssl_plugin_init (plugin *p)
-{
-    p->version      = LIGHTTPD_VERSION_ID;
-    p->name         = "boringssl";
-    p->init         = mod_openssl_init;
-    p->cleanup      = mod_openssl_free;
-    p->priv_defaults= mod_openssl_set_defaults;
-
-    p->handle_connection_accept  = mod_openssl_handle_con_accept;
-    p->handle_connection_shut_wr = mod_openssl_handle_con_shut_wr;
-    p->handle_connection_close   = mod_openssl_handle_con_close;
-    p->handle_uri_raw            = mod_openssl_handle_uri_raw;
-    p->handle_request_env        = mod_openssl_handle_request_env;
-    p->handle_request_reset      = mod_openssl_handle_request_reset;
-    p->handle_trigger            = mod_openssl_handle_trigger;
-
-    return 0;
 }
 
 

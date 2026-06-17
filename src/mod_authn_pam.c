@@ -34,21 +34,42 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 static handler_t mod_authn_pam_basic(request_st *r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 
+INIT_FUNC(mod_authn_pam_init);
+SETDEFAULTS_FUNC(mod_authn_pam_set_defaults);
+
+static const plugin mod_authn_pam_plugin = {
+  .name                         = "authn_pam",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_authn_pam_init,
+  .set_defaults                 = mod_authn_pam_set_defaults
+};
+
 INIT_FUNC(mod_authn_pam_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_authn_pam_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_auth_backend_t http_auth_backend_pam =
       { "pam", mod_authn_pam_basic, NULL, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_backend_pam */
-    http_auth_backend_pam.p_d = p;
+    http_auth_backend_pam.p_d = pd;
     http_auth_backend_set(&http_auth_backend_pam);
 
-    return p;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_authn_pam_plugin_init(plugin *p);
+int mod_authn_pam_plugin_init(plugin *p) {
+    memcpy(p, &mod_authn_pam_plugin, sizeof(plugin));
+    return 0;
 }
 
 static void mod_authn_pam_merge_config_cpv(plugin_config * const pconf, const config_plugin_value_t * const cpv) {
@@ -68,13 +89,12 @@ static void mod_authn_pam_merge_config(plugin_config * const pconf, const config
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_authn_pam_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_authn_pam_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_authn_pam_merge_config(&p->conf,
-                                        p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_authn_pam_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -140,7 +160,6 @@ static int mod_authn_pam_fn_conv(int num_msg, const struct pam_message **msg, st
 }
 
 static handler_t mod_authn_pam_query(request_st * const r, void *p_d, const buffer * const username, const char * const realm, const char * const pw) {
-    plugin_data *p = (plugin_data *)p_d;
     pam_handle_t *pamh = NULL;
     struct pam_conv conv = { mod_authn_pam_fn_conv, NULL };
     const int flags = PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK;
@@ -148,10 +167,11 @@ static handler_t mod_authn_pam_query(request_st * const r, void *p_d, const buff
     UNUSED(realm);
     *(const char **)&conv.appdata_ptr = pw; /*(cast away const)*/
 
-    mod_authn_pam_patch_config(r, p);
+    plugin_config pconf;
+    mod_authn_pam_patch_config(r, p_d, &pconf);
 
     const char * const addrstr = r->dst_addr_buf->ptr;
-    rc = pam_start(p->conf.service, username->ptr, &conv, &pamh);
+    rc = pam_start(pconf.service, username->ptr, &conv, &pamh);
     if (PAM_SUCCESS != rc
      || PAM_SUCCESS !=(rc = pam_set_item(pamh, PAM_RHOST, addrstr))
      || PAM_SUCCESS !=(rc = pam_authenticate(pamh, flags))
@@ -169,17 +189,4 @@ static handler_t mod_authn_pam_basic(request_st * const r, void *p_d, const http
     return http_auth_match_rules(require, username->ptr, NULL, NULL)
       ? HANDLER_GO_ON  /* access granted */
       : HANDLER_ERROR;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_authn_pam_plugin_init(plugin *p);
-int mod_authn_pam_plugin_init(plugin *p) {
-    p->version     = LIGHTTPD_VERSION_ID;
-    p->name        = "authn_pam";
-    p->init        = mod_authn_pam_init;
-    p->set_defaults= mod_authn_pam_set_defaults;
-
-    return 0;
 }

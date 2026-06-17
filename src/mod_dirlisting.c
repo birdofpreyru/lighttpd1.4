@@ -99,8 +99,7 @@ typedef struct {
 typedef struct {
 	PLUGIN_DATA;
 	plugin_config defaults;
-	plugin_config conf;
-	int processing;
+	int processing; /* thread-safety todo: atomic add/sub */
 } plugin_data;
 
 typedef struct {
@@ -149,12 +148,12 @@ static int dirlist_max_in_progress;
 
 
 __attribute_returns_nonnull__
-static handler_ctx * mod_dirlisting_handler_ctx_init (plugin_data * const p) {
+static handler_ctx * mod_dirlisting_handler_ctx_init (const plugin_config * const pconf) {
     handler_ctx *hctx = ck_calloc(1, sizeof(*hctx));
   #ifdef _WIN32
     hctx->hFind = INVALID_HANDLE_VALUE;
   #endif
-    memcpy(&hctx->conf, &p->conf, sizeof(plugin_config));
+    memcpy(&hctx->conf, pconf, sizeof(plugin_config));
     return hctx;
 }
 
@@ -263,7 +262,7 @@ static pcre_keyvalue_buffer * mod_dirlisting_parse_excludes(server *srv, const a
 #endif
 
 static int mod_dirlisting_exclude(pcre_keyvalue_buffer * const kvb, const char * const name, const uint32_t len) {
-    /*(re-use keyvalue.[ch] for match-only;
+    /*(reuse keyvalue.[ch] for match-only;
      *  must have been configured with empty kvb 'value' during init)*/
     buffer input = { NULL, len+1, 0 };
     *(const char **)&input.ptr = name;
@@ -282,9 +281,36 @@ static int mod_dirlisting_exclude(pcre_keyvalue_buffer * const kvb, const char *
         || -1 != ctx.m;
 }
 
+INIT_FUNC(mod_dirlisting_init);
+FREE_FUNC(mod_dirlisting_free);
+SETDEFAULTS_FUNC(mod_dirlisting_set_defaults);
+REQUEST_FUNC(mod_dirlisting_subrequest_start);
+REQUEST_FUNC(mod_dirlisting_subrequest);
+REQUEST_FUNC(mod_dirlisting_reset);
+
+static const plugin mod_dirlisting_plugin = {
+  .name                         = "dirlisting",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_dirlisting_init,
+  .cleanup                      = mod_dirlisting_free,
+  .set_defaults                 = mod_dirlisting_set_defaults,
+  .handle_subrequest_start      = mod_dirlisting_subrequest_start,
+  .handle_subrequest            = mod_dirlisting_subrequest,
+  .handle_request_reset         = mod_dirlisting_reset
+};
 
 INIT_FUNC(mod_dirlisting_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_dirlisting_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_dirlisting_plugin_init(plugin *p);
+int mod_dirlisting_plugin_init(plugin *p) {
+    memcpy(p, &mod_dirlisting_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_dirlisting_free) {
@@ -374,11 +400,11 @@ static void mod_dirlisting_merge_config(plugin_config * const pconf, const confi
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_dirlisting_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_dirlisting_patch_config(request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_dirlisting_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_dirlisting_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -685,19 +711,18 @@ static void http_dirlist_link (request_st * const r, const buffer *b, const char
                                 BUF_PTR_LEN(tb));
 }
 
-static void http_dirlist_auto_layout_early_hints (request_st * const r, const plugin_data * const p) {
-    if (p->conf.external_css)
-        http_dirlist_link(r, p->conf.external_css,
+static void http_dirlist_auto_layout_early_hints (request_st * const r, const plugin_config * const pconf) {
+    if (pconf->external_css)
+        http_dirlist_link(r, pconf->external_css,
           CONST_STR_LEN(">; rel=\"preload\"; as=\"style\""));
-    if (p->conf.external_js)
-        http_dirlist_link(r, p->conf.external_js,
+    if (pconf->external_js)
+        http_dirlist_link(r, pconf->external_js,
           CONST_STR_LEN(">; rel=\"preload\"; as=\"script\""));
 }
 
 /* portions copied from mod_status
  * modified and specialized for stable dirlist sorting by name */
 static const char js_simple_table_resort[] = \
-"var click_column;\n" \
 "var name_column = 0;\n" \
 "var date_column = 1;\n" \
 "var size_column = 2;\n" \
@@ -723,18 +748,7 @@ static const char js_simple_table_resort[] = \
 "    && (typeof el.dataset.value === 'string'\n" \
 "        || typeof el.dataset.value === 'number'))\n" \
 "  return el.dataset.value;\n" \
-" if(el.innerText)\n" \
-"  return el.innerText;\n" \
-" else {\n" \
-"  var str = \"\";\n" \
-"  var cs = el.childNodes;\n" \
-"  var l = cs.length;\n" \
-"  for (var i=0;i<l;i++) {\n" \
-"   if (cs[i].nodeType==1) str += get_inner_text(cs[i]);\n" \
-"   else if (cs[i].nodeType==3) str += cs[i].nodeValue;\n" \
-"  }\n" \
-" }\n" \
-" return str;\n" \
+" return el.textContent;\n" \
 "}\n" \
 "\n" \
 "var li_date_regex=/(\\d{4})-(\\w{3})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})/;\n" \
@@ -775,9 +789,7 @@ static const char js_simple_table_resort[] = \
 " var at = get_inner_text(a.cells[sort_column]);\n" \
 " var bt = get_inner_text(b.cells[sort_column]);\n" \
 " var cmp;\n" \
-" if (sort_column == size_column) {\n" \
-"  cmp = parseInt(at)-parseInt(bt);\n" \
-" } else if (sort_column == date_column) {\n" \
+" if (sort_column == size_column || sort_column == date_column) {\n" \
 "  cmp = at-bt;\n" \
 " } else {\n" \
 "  if (sort_column == name_column) {\n" \
@@ -792,31 +804,32 @@ static const char js_simple_table_resort[] = \
 " return sortfn_then_by_name(a,b,name_column);\n" \
 "}\n" \
 "\n" \
-"function sortfn(a,b) {\n" \
-" return sortfn_then_by_name(a,b,click_column);\n" \
-"}\n" \
-"\n" \
 "function resort(lnk) {\n" \
+" if (prev_span != null) prev_span.innerHTML = '';\n" \
+"\n" \
+" var click_column = lnk.parentNode.cellIndex;\n" \
+" function sortfn(a,b) {\n" \
+"  return sortfn_then_by_name(a,b,click_column);\n" \
+" }\n" \
+"\n" \
 " var span = lnk.childNodes[1];\n" \
 " var table = lnk.parentNode.parentNode.parentNode.parentNode;\n" \
-" click_column = lnk.parentNode.cellIndex;\n" \
 " if (click_column == date_column) li_dates_to_dv(table);\n" \
-" var rows = new Array();\n" \
-" for (var j=1;j<table.rows.length;j++)\n" \
-"  rows[j-1] = table.rows[j];\n" \
+" var tbody = table.tBodies[0];\n" \
+" var rows = Array.from(tbody.rows);\n" \
 " rows.sort(sortfn);\n" \
-"\n" \
-" if (prev_span != null) prev_span.innerHTML = '';\n" \
+" if (span.getAttribute('sortdir')=='down') rows.reverse();\n" \
+" tbody.innerHTML = '';\n" \
+" var frag = document.createDocumentFragment();\n" \
+" rows.forEach(row => frag.appendChild(row));\n" \
+" tbody.appendChild(frag);\n" \
 " if (span.getAttribute('sortdir')=='down') {\n" \
 "  span.innerHTML = '&uarr;';\n" \
 "  span.setAttribute('sortdir','up');\n" \
-"  rows.reverse();\n" \
 " } else {\n" \
 "  span.innerHTML = '&darr;';\n" \
 "  span.setAttribute('sortdir','down');\n" \
 " }\n" \
-" for (var i=0;i<rows.length;i++)\n" \
-"  table.tBodies[0].appendChild(rows[i]);\n" \
 " prev_span = span;\n" \
 "}\n";
 
@@ -825,12 +838,12 @@ static const char js_simple_table_init_sort[] = \
 "\n" \
 "function init_sort(init_sort_column, descending) {\n" \
 " var tables = document.getElementsByTagName(\"table\");\n" \
-" for (var i = 0; i < tables.length; i++) {\n" \
+" for (var i = 0, ilen = tables.length; i < ilen; ++i) {\n" \
 "  var table = tables[i];\n" \
 "  //var c = table.getAttribute(\"class\")\n" \
 "  //if (-1 != c.split(\" \").indexOf(\"sort\")) {\n" \
 "   var row = table.rows[0].cells;\n" \
-"   for (var j = 0; j < row.length; j++) {\n" \
+"   for (var j = 0, jlen = row.length; j < jlen; ++j) {\n" \
 "    var n = row[j];\n" \
 "    if (n.childNodes.length == 1 && n.childNodes[0].nodeType == 3) {\n" \
 "     var link = document.createElement(\"a\");\n" \
@@ -846,19 +859,21 @@ static const char js_simple_table_init_sort[] = \
 "     n.replaceChild(link, n.firstChild);\n" \
 "    }\n" \
 "   }\n" \
-"   var lnk = row[init_sort_column].firstChild;\n" \
-"   if (descending) {\n" \
-"    var span = lnk.childNodes[1];\n" \
-"    span.setAttribute('sortdir','down');\n" \
+"   if (init_sort_column >= 0) {\n" \
+"    var lnk = row[init_sort_column].firstChild;\n" \
+"    if (descending) {\n" \
+"     var span = lnk.childNodes[1];\n" \
+"     span.setAttribute('sortdir','down');\n" \
+"    }\n" \
+"    resort(lnk);\n" \
 "   }\n" \
-"   resort(lnk);\n" \
 "  //}\n" \
 " }\n" \
 "}\n" \
 "\n" \
 "function init_sort_from_query() {\n" \
 "  var urlParams = new URLSearchParams(location.search);\n" \
-"  var c = 0;\n" \
+"  var c = -1;\n" \
 "  var o = 0;\n" \
 "  switch (urlParams.get('C')) {\n" \
 "    case \"N\": c=0; break;\n" \
@@ -1461,7 +1476,7 @@ static void mod_dirlisting_stream_append (request_st * const r, handler_ctx * co
 
 SUBREQUEST_FUNC(mod_dirlisting_subrequest);
 REQUEST_FUNC(mod_dirlisting_reset);
-static handler_t mod_dirlisting_cache_check (request_st * const r, plugin_data * const p);
+static handler_t mod_dirlisting_cache_check (request_st * const r, plugin_config * const pconf);
 __attribute_noinline__
 static void mod_dirlisting_cache_add (request_st * const r, handler_ctx * const hctx);
 __attribute_noinline__
@@ -1473,17 +1488,16 @@ static void mod_dirlisting_cache_stream (request_st * const r, handler_ctx * con
 
 
 URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
-	plugin_data *p = p_d;
-
 	if (NULL != r->handler_module) return HANDLER_GO_ON;
 	if (!buffer_has_slash_suffix(&r->uri.path)) return HANDLER_GO_ON;
 	if (!http_method_get_or_head(r->http_method)) return HANDLER_GO_ON;
 	/* r->physical.path is non-empty for handle_subrequest_start */
 	/*if (buffer_is_blank(&r->physical.path)) return HANDLER_GO_ON;*/
 
-	mod_dirlisting_patch_config(r, p);
+	plugin_config pconf;
+	mod_dirlisting_patch_config(r, p_d, &pconf);
 
-	if (!p->conf.dir_listing) return HANDLER_GO_ON;
+	if (!pconf.dir_listing) return HANDLER_GO_ON;
 
 	if (r->conf.log_request_handling) {
 		log_debug(r->conf.errh, __FILE__, __LINE__,
@@ -1509,8 +1523,8 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 	/* XXX: would have to add "Vary: Accept" response header, too */
 	const buffer * const vb =
 	  http_header_request_get(r, HTTP_HEADER_ACCEPT, CONST_STR_LEN("Accept"));
-	p->conf.json = (vb && strstr(vb->ptr, "application/json")); /*(coarse)*/
-	if (p->conf.json) p->conf.auto_layout = 0;
+	pconf.json = (vb && strstr(vb->ptr, "application/json")); /*(coarse)*/
+	if (pconf.json) pconf.auto_layout = 0;
   #else
 	/* check URL for /<path>/?json to enable json output */
 	if (buffer_clen(&r->uri.query) == sizeof("json")-1
@@ -1525,13 +1539,13 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 		      & (FDEVENT_STREAM_RESPONSE|FDEVENT_STREAM_RESPONSE_BUFMIN)))
 			r->conf.stream_response_body |= FDEVENT_STREAM_RESPONSE;
 	  #endif
-		p->conf.json = 1;
-		p->conf.auto_layout = 0;
+		pconf.json = 1;
+		pconf.auto_layout = 0;
 	}
   #endif
 
-	if (p->conf.cache) {
-		handler_t rc = mod_dirlisting_cache_check(r, p);
+	if (pconf.cache) {
+		handler_t rc = mod_dirlisting_cache_check(r, &pconf);
 		if (rc != HANDLER_GO_ON)
 			return rc;
 	}
@@ -1540,6 +1554,7 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 	 * (attempt to avoid "livelock" scenarios or starvation of other requests)
 	 * (100 is still a high arbitrary limit;
 	 *  and limit applies only to directories larger than DIRLIST_BATCH-2) */
+	plugin_data *p = p_d;
 	if (p->processing == dirlist_max_in_progress) {
 		r->http_status = 503;
 		http_header_response_set(r, HTTP_HEADER_OTHER,
@@ -1548,7 +1563,7 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 		return HANDLER_FINISHED;
 	}
 
-	handler_ctx * const hctx = mod_dirlisting_handler_ctx_init(p);
+	handler_ctx * const hctx = mod_dirlisting_handler_ctx_init(&pconf);
 	hctx->use_xattr = r->conf.use_xattr;
 	hctx->mimetypes = r->conf.mimetypes;
 
@@ -1573,7 +1588,7 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 	}
 	++p->processing;
 
-	if (p->conf.json) {
+	if (pconf.json) {
 		hctx->jb = chunk_buffer_acquire();
 		buffer_append_char(hctx->jb, '[');
 		http_header_response_set(r, HTTP_HEADER_CONTENT_TYPE,
@@ -1581,9 +1596,9 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 		                         CONST_STR_LEN("application/json"));
 	}
 	else {
-		if (p->conf.auto_layout)
-			http_dirlist_auto_layout_early_hints(r, p);
-		if (!p->conf.sort) {
+		if (pconf.auto_layout)
+			http_dirlist_auto_layout_early_hints(r, &pconf);
+		if (!pconf.sort) {
 			mod_dirlisting_content_type(r, hctx->conf.encoding);
 			http_list_directory_header(r, hctx);
 			hctx->hb = chunk_buffer_acquire();
@@ -1592,18 +1607,18 @@ URIHANDLER_FUNC(mod_dirlisting_subrequest_start) {
 
 	if (hctx->jb || hctx->hb) {
 		hctx->jfd = -1;
-		if (p->conf.cache)
+		if (pconf.cache)
 			mod_dirlisting_cache_stream_init(r, hctx);
 		r->http_status = 200;
 		r->resp_body_started = 1;
 	}
 
 	r->plugin_ctx[p->id] = hctx;
-	r->handler_module = p->self;
+	r->handler_module = (plugin_data_base *)p;
 	handler_t rc = mod_dirlisting_subrequest(r, p);
 
-	if (rc == HANDLER_WAIT_FOR_EVENT && p->conf.auto_layout
-	    && (p->conf.external_js || p->conf.external_css)
+	if (rc == HANDLER_WAIT_FOR_EVENT && pconf.auto_layout
+	    && (pconf.external_js || pconf.external_css)
               /*(skip if might stream unsorted since r->http_status and
                * Content-Type would have to be saved/restored for response,
                * as well as any partial response body of html dir header)*/
@@ -1703,24 +1718,24 @@ static void mod_dirlisting_cache_etag (request_st * const r, int fd)
 }
 
 
-static handler_t mod_dirlisting_cache_check (request_st * const r, plugin_data * const p) {
+static handler_t mod_dirlisting_cache_check (request_st * const r, plugin_config * const pconf) {
     /* optional: an external process can trigger a refresh by deleting the cache
      * entry when the external process detects (or initiates) changes to dir */
     buffer * const tb = r->tmp_buf;
-    buffer_copy_path_len2(tb, BUF_PTR_LEN(p->conf.cache->path),
+    buffer_copy_path_len2(tb, BUF_PTR_LEN(pconf->cache->path),
                               BUF_PTR_LEN(&r->physical.path));
-    buffer_append_string_len(tb, p->conf.json ? "dirlist.json" : "dirlist.html",
+    buffer_append_string_len(tb, pconf->json ? "dirlist.json" : "dirlist.html",
                              sizeof("dirlist.html")-1);
     stat_cache_entry * const sce = stat_cache_get_entry_open(tb, 1);
     if (NULL == sce || sce->fd == -1)
         return HANDLER_GO_ON;
-    if (TIME64_CAST(sce->st.st_mtime) + p->conf.cache->max_age < log_epoch_secs)
+    if (TIME64_CAST(sce->st.st_mtime) + pconf->cache->max_age < log_epoch_secs)
         return HANDLER_GO_ON;
     const unix_time64_t max_age =
-      TIME64_CAST(sce->st.st_mtime) + p->conf.cache->max_age - log_epoch_secs;
+      TIME64_CAST(sce->st.st_mtime) + pconf->cache->max_age - log_epoch_secs;
 
-    !p->conf.json
-      ? mod_dirlisting_content_type(r, p->conf.encoding)
+    !pconf->json
+      ? mod_dirlisting_content_type(r, pconf->encoding)
       : http_header_response_set(r, HTTP_HEADER_CONTENT_TYPE,
                                  CONST_STR_LEN("Content-Type"),
                                  CONST_STR_LEN("application/json"));
@@ -1757,8 +1772,8 @@ static handler_t mod_dirlisting_cache_check (request_st * const r, plugin_data *
                                      CONST_STR_LEN("ETag"),
                                      BUF_PTR_LEN(etag));
     }
-    if (p->conf.auto_layout)
-        http_dirlist_auto_layout_early_hints(r, p);
+    if (pconf->auto_layout)
+        http_dirlist_auto_layout_early_hints(r, pconf);
 
     r->resp_body_finished = 1;
     return HANDLER_FINISHED;
@@ -1941,22 +1956,4 @@ static void mod_dirlisting_cache_stream (request_st * const r, handler_ctx * con
         unlink(hctx->jfn);
     free(hctx->jfn);
     hctx->jfn = NULL;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_dirlisting_plugin_init(plugin *p);
-int mod_dirlisting_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "dirlisting";
-
-	p->init        = mod_dirlisting_init;
-	p->handle_subrequest_start = mod_dirlisting_subrequest_start;
-	p->handle_subrequest       = mod_dirlisting_subrequest;
-	p->handle_request_reset    = mod_dirlisting_reset;
-	p->set_defaults  = mod_dirlisting_set_defaults;
-	p->cleanup     = mod_dirlisting_free;
-
-	return 0;
 }

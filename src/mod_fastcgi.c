@@ -13,6 +13,7 @@ typedef gw_handler_ctx   handler_ctx;
 #include "fdevent.h"
 #include "http_cgi.h"
 #include "http_chunk.h"
+#include "http_status.h"
 #include "log.h"
 #include "request.h"
 
@@ -27,6 +28,39 @@ typedef gw_handler_ctx   handler_ctx;
 #if GW_FILTER     != FCGI_FILTER
 #error "mismatched defines: (GW_FILTER != FCGI_FILTER)"
 #endif
+
+INIT_FUNC(mod_fastcgi_init);
+SETDEFAULTS_FUNC(mod_fastcgi_set_defaults);
+REQUEST_FUNC(fcgi_check_extension_1);
+REQUEST_FUNC(fcgi_check_extension_2);
+
+static const plugin mod_fastcgi_plugin = {
+  .name                         = "fastcgi",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_fastcgi_init,
+  .cleanup                      = gw_free,
+  .set_defaults                 = mod_fastcgi_set_defaults,
+  .handle_uri_clean             = fcgi_check_extension_1,
+  .handle_subrequest_start      = fcgi_check_extension_2,
+  .handle_subrequest            = gw_handle_subrequest,
+  .handle_request_reset         = gw_handle_request_reset,
+  .handle_trigger               = gw_handle_trigger,
+  .handle_waitpid               = gw_handle_waitpid_cb
+};
+
+INIT_FUNC(mod_fastcgi_init) {
+    plugin_data * const pd = gw_init();
+    pd->self = &mod_fastcgi_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_fastcgi_plugin_init(plugin *p);
+int mod_fastcgi_plugin_init(plugin *p) {
+    memcpy(p, &mod_fastcgi_plugin, sizeof(plugin));
+    return 0;
+}
 
 static void mod_fastcgi_merge_config_cpv(plugin_config * const pconf, const config_plugin_value_t * const cpv) {
     switch (cpv->k_id) { /* index into static config_plugin_keys_t cpk[] */
@@ -59,11 +93,11 @@ static void mod_fastcgi_merge_config(plugin_config * const pconf, const config_p
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_fastcgi_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_fastcgi_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_fastcgi_merge_config(&p->conf,p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_fastcgi_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -190,7 +224,8 @@ static handler_t fcgi_stdin_append(handler_ctx *hctx) {
 	if (hctx->gw_mode == GW_AUTHORIZER) req_cqlen = 0;
 
 	/* something to send ? */
-	for (offset = 0; offset != req_cqlen; offset += weWant) {
+	for (offset = 0; offset != req_cqlen
+	                 && chunkqueue_length(&hctx->wb) < 65536; offset += weWant){
 		weWant = req_cqlen - offset > FCGI_MAX_LENGTH ? FCGI_MAX_LENGTH : req_cqlen - offset;
 
 		if (-1 != hctx->wb_reqlen) {
@@ -265,11 +300,9 @@ static handler_t fcgi_create_env(handler_ctx *hctx) {
 	/* send FCGI_PARAMS */
 
 	if (0 != http_cgi_headers(r, &opts, fcgi_env_add, b)) {
-		r->http_status = 400;
-		r->handler_module = NULL;
 		buffer_clear(b);
 		chunkqueue_remove_finished_chunks(&hctx->wb);
-		return HANDLER_FINISHED;
+		return http_status_set_err(r, 400); /* Bad Request */
 	} else {
 		fcgi_header(&(header), FCGI_PARAMS, request_id,
 			    buffer_clen(b) - sizeof(FCGI_BeginRequestRecord) - sizeof(FCGI_Header), 0);
@@ -494,19 +527,18 @@ static handler_t fcgi_response_headers(request_st * const r, struct http_respons
 }
 
 static handler_t fcgi_check_extension(request_st * const r, void *p_d, int uri_path_handler) {
-	plugin_data *p = p_d;
-	handler_t rc;
-
 	if (NULL != r->handler_module) return HANDLER_GO_ON;
 
-	mod_fastcgi_patch_config(r, p);
-	if (NULL == p->conf.exts) return HANDLER_GO_ON;
+	plugin_config pconf;
+	mod_fastcgi_patch_config(r, p_d, &pconf);
+	if (NULL == pconf.exts) return HANDLER_GO_ON;
 
-	rc = gw_check_extension(r, p, uri_path_handler, 0);
+	handler_t rc = gw_check_extension(r, &pconf, p_d, uri_path_handler, 0);
 	if (HANDLER_GO_ON != rc) return rc;
 
-	if (r->handler_module == p->self) {
-		handler_ctx *hctx = r->plugin_ctx[p->id];
+	const plugin_data_base * const pd = p_d;
+	if (r->handler_module == pd) {
+		handler_ctx *hctx = r->plugin_ctx[pd->id];
 		hctx->opts.backend = BACKEND_FASTCGI;
 		hctx->opts.parse = fcgi_recv_parse;
 		hctx->opts.headers = fcgi_response_headers;
@@ -533,25 +565,4 @@ static handler_t fcgi_check_extension_1(request_st * const r, void *p_d) {
 /* start request handler */
 static handler_t fcgi_check_extension_2(request_st * const r, void *p_d) {
 	return fcgi_check_extension(r, p_d, 0);
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_fastcgi_plugin_init(plugin *p);
-int mod_fastcgi_plugin_init(plugin *p) {
-	p->version      = LIGHTTPD_VERSION_ID;
-	p->name         = "fastcgi";
-
-	p->init         = gw_init;
-	p->cleanup      = gw_free;
-	p->set_defaults = mod_fastcgi_set_defaults;
-	p->handle_request_reset    = gw_handle_request_reset;
-	p->handle_uri_clean        = fcgi_check_extension_1;
-	p->handle_subrequest_start = fcgi_check_extension_2;
-	p->handle_subrequest       = gw_handle_subrequest;
-	p->handle_trigger          = gw_handle_trigger;
-	p->handle_waitpid          = gw_handle_waitpid_cb;
-
-	return 0;
 }

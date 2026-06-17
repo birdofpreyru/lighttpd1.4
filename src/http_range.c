@@ -13,6 +13,7 @@
 #include "buffer.h"
 #include "chunk.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "request.h"
 
 /* arbitrary limit for max num ranges (additional ranges are ignored) */
@@ -307,8 +308,8 @@ http_range_not_satisfiable (request_st * const r, const off_t content_length)
     len += (uint32_t)li_itostrn(cr+len, sizeof(cr)-len, content_length);
     http_header_response_set(r, HTTP_HEADER_CONTENT_RANGE,
                              CONST_STR_LEN("Content-Range"), cr, len);
-    r->handler_module = NULL;
-    return (r->http_status = 416); /* Range Not Satisfiable */
+    http_status_set_err(r, 416); /* Range Not Satisfiable */
+    return 416;
 }
 
 
@@ -378,7 +379,7 @@ http_range_rfc7233 (request_st * const r)
      *   A server MUST ignore a Range header field received with a request
      *   method other than GET.
      */
-    if (!http_method_get_or_head(r->http_method))
+    if (!http_method_get_head_query(r->http_method))
         return http_status;
     /* no "Range" in HTTP/1.0 */
     if (r->http_version < HTTP_VERSION_1_1)
@@ -438,8 +439,9 @@ http_range_rfc7233 (request_st * const r)
      * [RFC7233] 3.1 Range
      *   A server MUST ignore a Range header field received with a request
      *   method other than GET.
+     * (extended to QUERY here, after limited to GET HEAD QUERY further above)
      */
-    if (r->http_method != HTTP_METHOD_GET)
+    if (r->http_method == HTTP_METHOD_HEAD)
         return http_status;
 
     /* check for Range request */

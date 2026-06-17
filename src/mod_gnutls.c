@@ -160,8 +160,8 @@ typedef struct {
 
 static int ssl_is_init;
 /* need assigned p->id for deep access of module handler_ctx for connection
- *   i.e. handler_ctx *hctx = con->plugin_ctx[plugin_data_singleton->id]; */
-static plugin_data *plugin_data_singleton;
+ *   i.e. handler_ctx *hctx = con->plugin_ctx[mod_gnutls_plugin_data->id]; */
+static plugin_data *mod_gnutls_plugin_data;
 #define LOCAL_SEND_BUFSIZE 16384 /* DEFAULT_MAX_RECORD_SIZE */
 static char *local_send_buffer;
 static int feature_refresh_certs;
@@ -408,8 +408,8 @@ mod_gnutls_session_ticket_key_file (const char *fn)
      *    4-byte - activation timestamp
      *    4-byte - expiration timestamp
      *   16-byte - session ticket key name
-     *   32-byte - session ticket HMAC encrpytion key
-     *   32-byte - session ticket AES encrpytion key
+     *   32-byte - session ticket HMAC encryption key
+     *   32-byte - session ticket AES encryption key
      *
      * STEK file can be created with a command such as:
      *   dd if=/dev/random bs=1 count=80 status=none | \
@@ -499,10 +499,49 @@ mod_gnutls_session_ticket_key_check (server *srv, const plugin_data *p, const un
 }
 
 
+INIT_FUNC(mod_gnutls_init);
+FREE_FUNC(mod_gnutls_free);
+SETDEFAULTS_FUNC(mod_gnutls_set_defaults);
+CONNECTION_FUNC(mod_gnutls_handle_con_accept);
+CONNECTION_FUNC(mod_gnutls_handle_con_shut_wr);
+CONNECTION_FUNC(mod_gnutls_handle_con_close);
+REQUEST_FUNC(mod_gnutls_handle_uri_raw);
+REQUEST_FUNC(mod_gnutls_handle_request_env);
+REQUEST_FUNC(mod_gnutls_handle_request_reset);
+TRIGGER_FUNC(mod_gnutls_handle_trigger);
+
+static const plugin mod_gnutls_plugin = {
+  .name                         = "gnutls",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_gnutls_init,
+  .cleanup                      = mod_gnutls_free,
+  .priv_defaults                = mod_gnutls_set_defaults,
+  .handle_connection_accept     = mod_gnutls_handle_con_accept,
+  .handle_connection_shut_wr    = mod_gnutls_handle_con_shut_wr,
+  .handle_connection_close      = mod_gnutls_handle_con_close,
+  .handle_uri_raw               = mod_gnutls_handle_uri_raw,
+  .handle_request_env           = mod_gnutls_handle_request_env,
+  .handle_request_reset         = mod_gnutls_handle_request_reset,
+  .handle_trigger               = mod_gnutls_handle_trigger
+};
+
+
 INIT_FUNC(mod_gnutls_init)
 {
-    plugin_data_singleton = (plugin_data *)ck_calloc(1, sizeof(plugin_data));
-    return plugin_data_singleton;
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_gnutls_plugin;
+    mod_gnutls_plugin_data = pd;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_gnutls_plugin_init (plugin *p);
+int mod_gnutls_plugin_init (plugin *p)
+{
+    memcpy(p, &mod_gnutls_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -626,7 +665,8 @@ mod_gnutls_load_config_crts (const char *fn, log_error_st *errh)
         return NULL;
     }
     else if (
-      !mod_gnutls_cert_is_active(((gnutls_x509_crt_t *)(void *)d->data)[0])) {
+      !mod_gnutls_cert_is_active(((gnutls_x509_crt_t *)(void *)d->data)[0])
+      && log_epoch_secs > 300) {
         log_error(errh, __FILE__, __LINE__,
           "GnuTLS: inactive/expired X509 certificate '%s'", fn);
     }
@@ -990,7 +1030,7 @@ mod_gnutls_merge_config(plugin_config * const pconf, const config_plugin_value_t
 static void
 mod_gnutls_patch_config (request_st * const r, plugin_config * const pconf)
 {
-    plugin_data * const p = plugin_data_singleton;
+    plugin_data * const p = mod_gnutls_plugin_data;
     memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
@@ -1574,8 +1614,6 @@ network_gnutls_load_pemfile (server *srv, const buffer *pemfile, const buffer *p
         int rc = mod_gnutls_construct_crt_chain(kp, d, srv->errh);
         if (rc < 0) {
             mod_gnutls_kp_free(kp);
-            mod_gnutls_free_config_crts(d);
-            gnutls_privkey_deinit(pkey);
             free(pc);
             return NULL;
         }
@@ -1689,8 +1727,6 @@ mod_gnutls_acme_tls_1 (handler_ctx *hctx)
     rc = mod_gnutls_construct_crt_chain(kp, d, errh);
     if (rc < 0) {
         mod_gnutls_kp_free(kp);
-        mod_gnutls_free_config_crts(d);
-        gnutls_privkey_deinit(pkey);
         return rc;
     }
 
@@ -1762,8 +1798,7 @@ mod_gnutls_ALPN (handler_ctx * const hctx, const unsigned char * const in, const
             if (in[i] == 'h' && in[i+1] == '2') {
                 if (!hctx->r->conf.h2proto) continue;
                 hctx->alpn = MOD_GNUTLS_ALPN_H2;
-                if (hctx->r->handler_module == NULL)/*(e.g. not mod_sockproxy)*/
-                    hctx->r->http_version = HTTP_VERSION_2;
+                hctx->r->http_version = HTTP_VERSION_2;
                 return GNUTLS_E_SUCCESS;
             }
             continue;
@@ -1805,7 +1840,7 @@ mod_gnutls_SNI(handler_ctx * const hctx,
                const unsigned char *servername, unsigned int len)
 {
     /* https://www.gnutls.org/manual/gnutls.html#Virtual-hosts-and-credentials
-     * figure the advertized name - the following hack relies on the fact that
+     * figure the advertised name - the following hack relies on the fact that
      * this extension only supports DNS names, and due to a protocol bug cannot
      * be extended to support anything else. */
     if (len < 5) return 0;
@@ -2466,7 +2501,7 @@ SETDEFAULTS_FUNC(mod_gnutls_set_defaults)
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("debug.log-ssl-noise"),
-        T_CONFIG_BOOL,
+        T_CONFIG_SHORT,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("ssl.verifyclient.ca-file"),
         T_CONFIG_STRING,
@@ -2731,7 +2766,7 @@ mod_gnutls_close_notify(handler_ctx *hctx);
 static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_gnutls_plugin_data->id];
     gnutls_session_t const ssl = hctx->ssl;
     if (!hctx->handshake) return 0;
 
@@ -2827,7 +2862,7 @@ connection_write_cq_ssl_ktls (connection * const con, chunkqueue * const cq, off
      * Therefore, callers should ensure GNUTLS_KTLS_SEND is enabled before
      * configuring: con->network_write = connection_write_cq_ssl_ktls */
 
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_gnutls_plugin_data->id];
     if (!hctx->handshake) return 0;
 
     if (hctx->pending_write) {
@@ -2913,7 +2948,7 @@ mod_gnutls_ssl_handshake (handler_ctx *hctx)
 static int
 connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_gnutls_plugin_data->id];
 
     UNUSED(max_bytes);
 
@@ -2956,8 +2991,7 @@ static void
 mod_gnutls_debug_cb(int level, const char *str)
 {
     UNUSED(level);
-    log_error_st *errh = plugin_data_singleton->srv->errh;
-    log_error(errh, __FILE__, __LINE__, "GnuTLS: %s", str);
+    log_error(NULL, __FILE__, __LINE__, "GnuTLS: %s", str);
 }
 
 
@@ -3479,29 +3513,6 @@ TRIGGER_FUNC(mod_gnutls_handle_trigger) {
 }
 
 
-__attribute_cold__
-__declspec_dllexport__
-int mod_gnutls_plugin_init (plugin *p);
-int mod_gnutls_plugin_init (plugin *p)
-{
-    p->version      = LIGHTTPD_VERSION_ID;
-    p->name         = "gnutls";
-    p->init         = mod_gnutls_init;
-    p->cleanup      = mod_gnutls_free;
-    p->priv_defaults= mod_gnutls_set_defaults;
-
-    p->handle_connection_accept  = mod_gnutls_handle_con_accept;
-    p->handle_connection_shut_wr = mod_gnutls_handle_con_shut_wr;
-    p->handle_connection_close   = mod_gnutls_handle_con_close;
-    p->handle_uri_raw            = mod_gnutls_handle_uri_raw;
-    p->handle_request_env        = mod_gnutls_handle_request_env;
-    p->handle_request_reset      = mod_gnutls_handle_request_reset;
-    p->handle_trigger            = mod_gnutls_handle_trigger;
-
-    return 0;
-}
-
-
 /* cipher suites
  *
  * (extremely coarse (and very possibly incorrect) mapping to openssl labels)
@@ -3910,24 +3921,49 @@ mod_gnutls_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *c
       "ffdhe4096",  "GROUP-FFDHE4096",
       "ffdhe6144",  "GROUP-FFDHE6144",
       "ffdhe8192",  "GROUP-FFDHE8192",
+      "MLKEM768",   "GROUP-MLKEM768",
+      "MLKEM1024",  "GROUP-MLKEM1024",
+      "SecP256r1MLKEM768",  "GROUP-SECP256R1-MLKEM768",
+      "SecP384r1MLKEM1024", "GROUP-SECP384R1-MLKEM1024",
+      "X25519MLKEM768",     "GROUP-X25519-MLKEM768"
     };
+
+    /* runtime test for gnutls library support for PQC hybrid groups */
+    gnutls_priority_t priority_cache;
+    const char *err_pos;
+    int rc = gnutls_priority_init(&priority_cache,
+                                  "SECURE:+GROUP-X25519-MLKEM768", &err_pos);
+    gnutls_priority_deinit(priority_cache);
+    const int mlkem = (0 == rc);
 
     buffer * const plist = &s->priority_str;
     const char *groups = curvelist && !buffer_is_blank(curvelist)
       ? curvelist->ptr
-      : "X25519:P-256:P-384:X448";
+      :
+       #if GNUTLS_VERSION_NUMBER >= 0x030808
+        /*"X25519MLKEM768:SecP256r1MLKEM768:"*/
+        "X25519MLKEM768:"
+       #endif
+        "X25519:P-256:P-384:X448";
     for (const char *e; groups; groups = e ? e+1 : NULL) {
         const char * const n = groups;
         e = strchr(n, ':');
         size_t len = e ? (size_t)(e - n) : strlen(n);
         uint32_t i;
-        for (i = 0; i < sizeof(names)/sizeof(*names)/2; i += 2) {
+        for (i = 0; i < sizeof(names)/sizeof(*names); i += 2) {
             if (0 == strncmp(names[i], n, len) && names[i][len] == '\0')
                 break;
         }
-        if (i == sizeof(names)/sizeof(*names)/2) {
+        if (i == sizeof(names)/sizeof(*names)) {
             log_error(srv->errh, __FILE__, __LINE__,
                       "GnuTLS: unrecognized curve: %.*s; ignored", (int)len, n);
+            continue;
+        }
+
+        /* check gnutls library support for PQC hybrid groups */
+        if (!mlkem && strstr(names[i], "MLKEM") != NULL && curvelist) {
+            log_error(srv->errh, __FILE__, __LINE__,
+                      "GnuTLS: unsupported group: %.*s; ignored", (int)len, n);
             continue;
         }
 

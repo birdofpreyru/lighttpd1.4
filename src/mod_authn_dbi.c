@@ -73,9 +73,7 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
-
 
 /* used to reconnect to the database when we get disconnected */
 static void
@@ -198,7 +196,7 @@ mod_authn_dbi_dbconf_setup (server *srv, const array *opts, void **vdata)
 
         /* connect to database */
         mod_authn_dbi_error_callback(dbconn, dbconf);
-        if (dbconf->reconnect_count >= 3) {
+        if (dbconf->reconnect_count > 3) {
             mod_authn_dbi_dbconf_free(dbconf);
             return -1;
         }
@@ -211,16 +209,42 @@ mod_authn_dbi_dbconf_setup (server *srv, const array *opts, void **vdata)
 static handler_t mod_authn_dbi_basic(request_st *r, void *p_d, const http_auth_require_t *require, const buffer *username, const char *pw);
 static handler_t mod_authn_dbi_digest(request_st *r, void *p_d, http_auth_info_t *dig);
 
+INIT_FUNC(mod_authn_dbi_init);
+FREE_FUNC(mod_authn_dbi_cleanup);
+SETDEFAULTS_FUNC(mod_authn_dbi_set_defaults);
+
+static const plugin mod_authn_dbi_plugin = {
+  .name                         = "authn_dbi",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_authn_dbi_init,
+  .cleanup                      = mod_authn_dbi_cleanup,
+  .set_defaults                 = mod_authn_dbi_set_defaults
+};
+
+
 INIT_FUNC(mod_authn_dbi_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_authn_dbi_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_auth_backend_t http_auth_backend_dbi =
       { "dbi", mod_authn_dbi_basic, mod_authn_dbi_digest, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_auth_backend_dbi */
-    http_auth_backend_dbi.p_d = p;
+    http_auth_backend_dbi.p_d = pd;
     http_auth_backend_set(&http_auth_backend_dbi);
 
-    return p;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_authn_dbi_plugin_init(plugin *p);
+int mod_authn_dbi_plugin_init(plugin *p) {
+    memcpy(p, &mod_authn_dbi_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -268,14 +292,13 @@ mod_authn_dbi_merge_config (plugin_config * const pconf, const config_plugin_val
 
 
 static void
-mod_authn_dbi_patch_config(request_st * const r, plugin_data * const p)
+mod_authn_dbi_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf)
 {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_authn_dbi_merge_config(&p->conf,
-                                       p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_authn_dbi_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -504,10 +527,10 @@ mod_authn_dbi_query_build (buffer * const sqlquery, dbi_config * const dbconf, h
 static handler_t
 mod_authn_dbi_query (request_st * const r, void *p_d, http_auth_info_t * const ai, const char * const pw)
 {
-    plugin_data * const p = (plugin_data *)p_d;
-    mod_authn_dbi_patch_config(r, p);
-    if (NULL == p->conf.vdata) return HANDLER_ERROR; /*(should not happen)*/
-    dbi_config * const dbconf = (dbi_config *)p->conf.vdata;
+    plugin_config pconf;
+    mod_authn_dbi_patch_config(r, p_d, &pconf);
+    if (NULL == pconf.vdata) return HANDLER_ERROR; /*(should not happen)*/
+    dbi_config * const dbconf = (dbi_config *)pconf.vdata;
 
     buffer * const sqlquery = mod_authn_dbi_query_build(r->tmp_buf, dbconf, ai);
     if (NULL == sqlquery)
@@ -592,19 +615,4 @@ static handler_t
 mod_authn_dbi_digest (request_st * const r, void *p_d, http_auth_info_t * const ai)
 {
     return mod_authn_dbi_query(r, p_d, ai, NULL);
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_authn_dbi_plugin_init (plugin *p);
-int mod_authn_dbi_plugin_init (plugin *p)
-{
-    p->version          = LIGHTTPD_VERSION_ID;
-    p->name             = "authn_dbi";
-    p->init             = mod_authn_dbi_init;
-    p->cleanup          = mod_authn_dbi_cleanup;
-    p->set_defaults     = mod_authn_dbi_set_defaults;
-
-    return 0;
 }

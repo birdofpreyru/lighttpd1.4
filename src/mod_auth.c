@@ -16,6 +16,7 @@
 #include "base.h"
 #include "ck.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "log.h"
 #include "algo_splaytree.h"
 #include "plugin.h"
@@ -40,7 +41,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 typedef struct {
@@ -216,20 +216,48 @@ static handler_t mod_auth_check_basic(request_st *r, void *p_d, const struct htt
 static handler_t mod_auth_check_digest(request_st *r, void *p_d, const struct http_auth_require_t *require, const struct http_auth_backend_t *backend);
 static handler_t mod_auth_check_extern(request_st *r, void *p_d, const struct http_auth_require_t *require, const struct http_auth_backend_t *backend);
 
+INIT_FUNC(mod_auth_init);
+FREE_FUNC(mod_auth_free);
+SETDEFAULTS_FUNC(mod_auth_set_defaults);
+REQUEST_FUNC(mod_auth_uri_handler);
+TRIGGER_FUNC(mod_auth_periodic);
+
+static const plugin mod_auth_plugin = {
+  .name                         = "auth",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_auth_init,
+  .cleanup                      = mod_auth_free,
+  .set_defaults                 = mod_auth_set_defaults,
+  .handle_uri_clean             = mod_auth_uri_handler,
+  .handle_trigger               = mod_auth_periodic
+};
+
 INIT_FUNC(mod_auth_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_auth_plugin;
+
+	/* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
 	static http_auth_scheme_t http_auth_scheme_basic  = { "basic",  mod_auth_check_basic,  NULL };
 	static http_auth_scheme_t http_auth_scheme_digest = { "digest", mod_auth_check_digest, NULL };
 	static const http_auth_scheme_t http_auth_scheme_extern = { "extern", mod_auth_check_extern, NULL };
-	plugin_data *p = ck_calloc(1, sizeof(*p));
 
 	/* register http_auth_scheme_* */
-	http_auth_scheme_basic.p_d = p;
+	http_auth_scheme_basic.p_d = pd;
 	http_auth_scheme_set(&http_auth_scheme_basic);
-	http_auth_scheme_digest.p_d = p;
+	http_auth_scheme_digest.p_d = pd;
 	http_auth_scheme_set(&http_auth_scheme_digest);
 	http_auth_scheme_set(&http_auth_scheme_extern);
 
-	return p;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_auth_plugin_init(plugin *p);
+int mod_auth_plugin_init(plugin *p) {
+    memcpy(p, &mod_auth_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_auth_free) {
@@ -589,12 +617,12 @@ static void mod_auth_merge_config(plugin_config * const pconf, const config_plug
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_auth_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_auth_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_auth_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_auth_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -675,46 +703,31 @@ SETDEFAULTS_FUNC(mod_auth_set_defaults) {
 }
 
 static handler_t mod_auth_uri_handler(request_st * const r, void *p_d) {
-	plugin_data *p = p_d;
-	data_auth *dauth;
+	plugin_config pconf;
+	mod_auth_patch_config(r, p_d, &pconf);
 
-	mod_auth_patch_config(r, p);
-
-	if (p->conf.auth_require == NULL) return HANDLER_GO_ON;
+	if (pconf.auth_require == NULL) return HANDLER_GO_ON;
 
 	/* search auth directives for first prefix match against URL path */
 	/* if we have a case-insensitive FS we have to lower-case the URI here too */
-	dauth = (!r->conf.force_lowercase_filenames)
-	   ? (data_auth *)array_match_key_prefix(p->conf.auth_require, &r->uri.path)
-	   : (data_auth *)array_match_key_prefix_nc(p->conf.auth_require, &r->uri.path);
+	const data_auth * const dauth = (!r->conf.force_lowercase_filenames)
+	   ? (data_auth *)array_match_key_prefix(pconf.auth_require, &r->uri.path)
+	   : (data_auth *)array_match_key_prefix_nc(pconf.auth_require, &r->uri.path);
 	if (NULL == dauth) return HANDLER_GO_ON;
 
 	{
-			const http_auth_scheme_t * const scheme = dauth->require->scheme;
-			if (p->conf.auth_extern_authn) {
+			if (pconf.auth_extern_authn) {
 				const buffer *vb = http_header_env_get(r, CONST_STR_LEN("REMOTE_USER"));
 				if (NULL != vb && http_auth_match_rules(dauth->require, vb->ptr, NULL, NULL)) {
 					return HANDLER_GO_ON;
 				}
 			}
-			return scheme->checkfn(r, scheme->p_d, dauth->require, p->conf.auth_backend);
+			/* NOTE: &pconf passed instead of scheme->p_d
+			 * Third-party scheme could access its own static plugin_data config
+			 * or needs to call its own _patch_config() to get its config */
+			const http_auth_scheme_t * const scheme = dauth->require->scheme;
+			return scheme->checkfn(r, &pconf, dauth->require, pconf.auth_backend);
 	}
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_auth_plugin_init(plugin *p);
-int mod_auth_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "auth";
-	p->init        = mod_auth_init;
-	p->set_defaults = mod_auth_set_defaults;
-	p->handle_trigger = mod_auth_periodic;
-	p->handle_uri_clean = mod_auth_uri_handler;
-	p->cleanup     = mod_auth_free;
-
-	return 0;
 }
 
 
@@ -732,14 +745,11 @@ int mod_auth_plugin_init(plugin *p) {
 #include "http_header.h"
 
 __attribute_cold__
-__attribute_noinline__
 static handler_t
 mod_auth_send_400_bad_request (request_st * const r)
 {
     /* a field was missing or invalid */
-    r->http_status = 400; /* Bad Request */
-    r->handler_module = NULL;
-    return HANDLER_FINISHED;
+    return http_status_set_err(r, 400); /* Bad Request */
 }
 
 
@@ -748,15 +758,13 @@ __attribute_noinline__
 static handler_t
 mod_auth_send_401_unauthorized_basic (request_st * const r, const buffer * const realm)
 {
-    r->http_status = 401;
-    r->handler_module = NULL;
     buffer_append_str3(
       http_header_response_set_ptr(r, HTTP_HEADER_WWW_AUTHENTICATE,
                                    CONST_STR_LEN("WWW-Authenticate")),
       CONST_STR_LEN("Basic realm=\""),
       BUF_PTR_LEN(realm),
       CONST_STR_LEN("\", charset=\"UTF-8\""));
-    return HANDLER_FINISHED;
+    return http_status_set_err(r, 401); /* Unauthorized */
 }
 
 
@@ -772,9 +780,7 @@ mod_auth_basic_misconfigured (request_st * const r, const struct http_auth_backe
           "auth.require \"method\" => \"basic\" invalid "
           "(try \"digest\"?) for %s", r->uri.path.ptr);
 
-    r->http_status = 500;
-    r->handler_module = NULL;
-    return HANDLER_FINISHED;
+    return http_status_set_err(r, 500); /* Internal Server Error */
 }
 
 
@@ -821,9 +827,9 @@ mod_auth_check_basic(request_st * const r, void *p_d, const struct http_auth_req
     pwlen = (size_t)(user + ulen - pw);
     ulen  = (size_t)(pw - 1 - user);
 
-    plugin_data * const p = p_d;
-    splay_tree ** sptree = p->conf.auth_cache
-      ? &p->conf.auth_cache->sptree
+    plugin_config * const pconf = p_d; /* pconf; see mod_auth_uri_handler() */
+    splay_tree ** const sptree = pconf->auth_cache
+      ? &pconf->auth_cache->sptree
       : NULL;
     http_auth_cache_entry *ae = NULL;
     handler_t rc = HANDLER_ERROR;
@@ -1052,7 +1058,7 @@ mod_auth_append_nonce (buffer *b, unix_time64_t cur_ts, const struct http_auth_r
 
 
 static void
-mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct http_auth_require_t *require, int nonce_stale)
+mod_auth_digest_www_authenticate (request_st * const r, unix_time64_t cur_ts, const struct http_auth_require_t *require, int nonce_stale)
 {
     int algos = nonce_stale ? nonce_stale : require->algorithm;
     int n = 0;
@@ -1082,17 +1088,17 @@ mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct 
         ++n;
     }
 
-    buffer_clear(b);
+    buffer * const b = r->tmp_buf;
     for (int i = 0; i < n; ++i) {
         struct const_iovec iov[] = {
-          { CONST_STR_LEN("\r\nWWW-Authenticate: ") }
-         ,{ CONST_STR_LEN("Digest realm=\"") }
+          { CONST_STR_LEN("Digest realm=\"") }
          ,{ BUF_PTR_LEN(require->realm) }
          ,{ CONST_STR_LEN("\", charset=\"UTF-8\", algorithm=") }
          ,{ algoname[i], algolen[i] }
          ,{ CONST_STR_LEN(", nonce=\"") }
         };
-        buffer_append_iovec(b, iov+(0==i), sizeof(iov)/sizeof(*iov)-(0==i));
+        buffer_clear(b);
+        buffer_append_iovec(b, iov, sizeof(iov)/sizeof(*iov));
         mod_auth_append_nonce(b, cur_ts, require, algoid[i], NULL);
         buffer_append_string_len(b, CONST_STR_LEN("\", qop=\"auth\""));
         if (require->userhash) {
@@ -1101,6 +1107,9 @@ mod_auth_digest_www_authenticate (buffer *b, unix_time64_t cur_ts, const struct 
         if (nonce_stale) {
             buffer_append_string_len(b, CONST_STR_LEN(", stale=true"));
         }
+        http_header_response_insert(r, HTTP_HEADER_WWW_AUTHENTICATE,
+                                    CONST_STR_LEN("WWW-Authenticate"),
+                                    BUF_PTR_LEN(b));
     }
 }
 
@@ -1109,13 +1118,8 @@ __attribute_noinline__
 static handler_t
 mod_auth_send_401_unauthorized_digest(request_st * const r, const struct http_auth_require_t * const require, int nonce_stale)
 {
-    r->http_status = 401;
-    r->handler_module = NULL;
-    mod_auth_digest_www_authenticate(
-      http_header_response_set_ptr(r, HTTP_HEADER_WWW_AUTHENTICATE,
-                                   CONST_STR_LEN("WWW-Authenticate")),
-      log_epoch_secs, require, nonce_stale);
-    return HANDLER_FINISHED;
+    mod_auth_digest_www_authenticate(r, log_epoch_secs, require, nonce_stale);
+    return http_status_set_err(r, 401); /* Unauthorized */
 }
 
 
@@ -1132,9 +1136,9 @@ mod_auth_digest_authentication_info (buffer *b, unix_time64_t cur_ts, const stru
 static handler_t
 mod_auth_digest_get (request_st * const r, void *p_d, const struct http_auth_require_t * const require, const struct http_auth_backend_t * const backend, http_auth_info_t * const ai)
 {
-    plugin_data * const p = p_d;
-    splay_tree **sptree = p->conf.auth_cache
-      ? &p->conf.auth_cache->sptree
+    plugin_config * const pconf = p_d; /* pconf; see mod_auth_uri_handler() */
+    splay_tree ** const sptree = pconf->auth_cache
+      ? &pconf->auth_cache->sptree
       : NULL;
     http_auth_cache_entry *ae = NULL;
     handler_t rc = HANDLER_GO_ON;
@@ -1215,9 +1219,7 @@ mod_auth_digest_misconfigured (request_st * const r, const struct http_auth_back
           "auth.require \"method\" => \"digest\" invalid "
           "(try \"basic\"?) for %s", r->uri.path.ptr);
 
-    r->http_status = 500;
-    r->handler_module = NULL;
-    return HANDLER_FINISHED;
+    return http_status_set_err(r, 500); /* Internal Server Error */
 }
 
 
@@ -1591,11 +1593,7 @@ static handler_t mod_auth_check_extern(request_st * const r, void *p_d, const st
     const buffer *vb = http_header_env_get(r, CONST_STR_LEN("REMOTE_USER"));
     UNUSED(p_d);
     UNUSED(backend);
-    if (NULL != vb && http_auth_match_rules(require, vb->ptr, NULL, NULL)) {
-        return HANDLER_GO_ON;
-    } else {
-        r->http_status = 401;
-        r->handler_module = NULL;
-        return HANDLER_FINISHED;
-    }
+    return (NULL != vb && http_auth_match_rules(require, vb->ptr, NULL, NULL))
+      ? HANDLER_GO_ON
+      : http_status_set_err(r, 401); /* Unauthorized */
 }

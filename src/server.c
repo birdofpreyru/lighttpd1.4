@@ -18,6 +18,7 @@
 #include "network_write.h"  /* network_write_show_handlers() */
 #include "reqpool.h"        /* request_pool_init() request_pool_free() */
 #include "response.h"       /* http_dispatch[] strftime_cache_reset() */
+                            /* http_response_fn_init() */
 
 #ifdef HAVE_VERSIONSTAMP_H
 # include "versionstamp.h"
@@ -1710,6 +1711,7 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 		  "Initialization of plugins failed. Going down.");
 		return -1;
 	}
+	http_response_fn_init(srv);
 
 	http_dispatch[HTTP_VERSION_1_1] = h1_1_dispatch_table; /* copy struct */
 
@@ -1728,7 +1730,7 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	/* mod_indexfile should be listed in server.modules prior to dynamic handlers */
 	uint32_t i = 0;
 	for (const char *pname = NULL; i < srv->plugins.used; ++i) {
-		plugin *p = ((plugin **)srv->plugins.ptr)[i];
+		const plugin *p = ((plugin_data_base **)srv->plugins.ptr)[i]->self;
 		if (0 == strcmp(p->name, "indexfile")) {
 			if (pname)
 				log_warn(srv->errh, __FILE__, __LINE__,
@@ -1786,7 +1788,7 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 		/*(default upper limit of 4k if server.max-fds not specified)*/
 		if (0 == srv->srvconf.max_fds)
 			srv->srvconf.max_fds = (rlim.rlim_cur <= 4096)
-			  ? (unsigned short)rlim.rlim_cur
+			  ? rlim.rlim_cur
 			  : 4096;
 
 		/* set core file rlimit, if enable_cores is set */
@@ -2033,6 +2035,8 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	}
 #endif
 
+	if (srv->srvconf.max_fds > 1048576) /*(sanity check; still quite large)*/
+	    srv->srvconf.max_fds = 1048576;
 	srv->max_fds = (int)srv->srvconf.max_fds;
         if (srv->max_fds < 32) /*(sanity check; not expected)*/
             srv->max_fds = 32; /*(server load checks will fail if too low)*/
@@ -2046,19 +2050,25 @@ static int server_main_setup (server * const srv, int argc, char **argv) {
 	srv->max_fds_hiwat = srv->max_fds * 9 / 10;
 
 	/* set max-conns */
-	if (srv->srvconf.max_conns > srv->max_fds/2) {
-		/* we can't have more connections than max-fds/2 */
+	/* too many connections + requests may exhaust max_fds limit */
+	const int factor = config_feature_bool(srv, "server.h2proto", 1)
+	  ? 10 /*(mod_h2 currently sets limit to 8 concurrent streams per connection)*/
+	  : 2;
+	if (srv->srvconf.max_conns > srv->max_fds / factor) {
 		log_warn(srv->errh, __FILE__, __LINE__,
-		  "can't have more connections than fds/2: %hu %d",
-		  srv->srvconf.max_conns, srv->max_fds);
-		srv->lim_conns = srv->srvconf.max_conns = srv->max_fds/2;
-	} else if (srv->srvconf.max_conns) {
-		/* otherwise respect the wishes of the user */
-		srv->lim_conns = srv->srvconf.max_conns;
-	} else {
-		/* or use the default: we really don't want to hit max-fds */
-		srv->lim_conns = srv->srvconf.max_conns = srv->max_fds/3;
+		  "reducing server.max-connections (%hu) to 1/%d server.max-fds (%d)",
+		  srv->srvconf.max_conns, factor, srv->max_fds);
+		srv->srvconf.max_conns = srv->max_fds / factor;
 	}
+	else if (srv->srvconf.max_conns) {
+		/* respect admin server.max-connections if <= safety threshold */
+	}
+	else {
+		/* or use the default: we really don't want to hit max-fds */
+		int max_conns = srv->max_fds / (factor > 2 ? factor : 3);
+		srv->srvconf.max_conns = max_conns <= USHRT_MAX ? max_conns : USHRT_MAX;
+	}
+	srv->lim_conns = srv->srvconf.max_conns;
 
   #if defined(HAVE_MALLOC_TRIM)
 	if (srv->srvconf.max_conns <= 16 && malloc_top_pad == 524288)
@@ -2355,6 +2365,8 @@ static int main_init_once (void) {
             setenv("SHELL", "/bin/sh", 1);
     }
   #endif
+
+    ck_static_assert(sizeof(off_t) == 8); /* sanity check: 64-bit off_t */
 
     return 1;
 }

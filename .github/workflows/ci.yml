@@ -30,7 +30,7 @@ jobs:
         platform: ['x64']
         compiler: ['gcc']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install packages
         run: |
           sudo apt-get update
@@ -40,7 +40,7 @@ jobs:
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
-            libmbedtls-dev libnss3-dev libssl-dev libwolfssl-dev \
+            libmbedtls-dev libnss3-dev libssl-dev \
             libpcre2-dev libbrotli-dev libdeflate-dev zlib1g-dev libzstd-dev \
             libsasl2-dev libkrb5-dev libdbi-dev libpam-dev libldap-dev \
             libmariadb-dev libpq-dev \
@@ -63,7 +63,7 @@ jobs:
         platform: ['x64']
         compiler: ['clang']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install packages
         run: |
           sudo apt-get update
@@ -73,7 +73,7 @@ jobs:
             cmake meson ninja-build pkg-config scons \
             autoconf automake autotools-dev libtool m4 \
             nettle-dev gnutls-dev \
-            libmbedtls-dev libnss3-dev libssl-dev libwolfssl-dev \
+            libmbedtls-dev libnss3-dev libssl-dev \
             libpcre2-dev libbrotli-dev libdeflate-dev zlib1g-dev libzstd-dev \
             libsasl2-dev libkrb5-dev libdbi-dev libpam-dev libldap-dev \
             libmariadb-dev libpq-dev \
@@ -90,7 +90,7 @@ jobs:
   macOS:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install packages
         run: |
           brew install -q meson ninja pkg-config pcre2 perl \
@@ -104,13 +104,14 @@ jobs:
       - name: Compile and Test
         run: |
           set -e
+          export WITH_WOLFSSL=1
           export NO_UNWIND=1
           cd "${{github.workspace}}" && scripts/ci-build.sh meson
 
   DragonflyBSD:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: vmactions/dragonflybsd-vm@v1
         with:
           usesh: true
@@ -125,11 +126,20 @@ jobs:
   FreeBSD:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: vmactions/freebsd-vm@v1
         with:
+          mem: 11264
+          cpu: 4
           usesh: true
+          copyback: false
           prepare: |
+            mount -t procfs proc /proc
+          run: |
+            #mkdir -p /usr/local/etc/pkg/repos
+            #echo 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg update -f -q
+            pkg upgrade -y
             pkg install -y autoconf automake autotools libtool m4 pkgconf \
               ninja meson cmake scons-py311 pcre2 perl5 \
               gnutls libressl mbedtls3 nettle nss wolfssl \
@@ -138,8 +148,8 @@ jobs:
               brotli libdeflate zstd \
               libmaxminddb libunwind lua51 lua54 \
               libxml2 sqlite3
-          run: |
             set -e
+            export WITH_WOLFSSL=1
             cd "${{github.workspace}}" && scripts/ci-build.sh meson
             cd "${{github.workspace}}" && scripts/ci-build.sh cmake
             cd "${{github.workspace}}" && scripts/ci-build.sh scons
@@ -148,33 +158,29 @@ jobs:
   NetBSD:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: vmactions/netbsd-vm@v1
         with:
           #usesh: true
           prepare: |
-            pkg_add dash cmake ninja pkgconf pcre2 perl \
+            pkg_add -u dash cmake ninja pkgconf pcre2 perl \
               gnutls libressl mbedtls nettle nss wolfssl \
               cyrus-sasl mit-krb5 libdbi openldap-client \
               mariadb-client postgresql16-client \
               brotli libdeflate zlib zstd \
               libmaxminddb libunwind lua51 lua54 \
               libxml2 sqlite3
-            pkg_add dash
-          # note: repeat 'pkg_add dash' to exit 0
-          #   since NetBSD 10.0 has some issues with the packaging of the listed
-          #   packages above and exits non-zero due to various packaging issues,
-          #   but the result is still sufficient for lighttpd CI build tests.
           # autoconf automake gmake libtool m4 meson py311-scons
           run: |
             set -e
+            export WITH_WOLFSSL=1
             export NO_UNWIND=1
             cd "${{github.workspace}}" && scripts/ci-build.sh cmake
 
   OpenBSD:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: vmactions/openbsd-vm@v1
         with:
           usesh: true
@@ -197,7 +203,7 @@ jobs:
   Solaris:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: vmactions/solaris-vm@v1
         with:
           release: "11.4-gcc"
@@ -246,7 +252,7 @@ jobs:
       CYGWIN: winsymlinks:native
     steps:
       - run: git config --global core.autocrlf input
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Set up env and create cache dir
         id: env
         shell: pwsh
@@ -254,7 +260,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "CACHE_KEY=$(Get-Date -UFormat "%Y-%m")" -Encoding utf8NoBOM
           New-Item -ItemType Directory -Force -Path D:\cygwin
       - name: Cache Cygwin installation
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /cygwin
           key: cygwin-${{ runner.os }}-${{ env.CACHE_KEY }}
@@ -292,7 +298,7 @@ jobs:
           cd "${{github.workspace}}" && /bin/dash scripts/ci-build.sh autobuild
 
   Windows-VisualStudio:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     name: Windows-VisualStudio-${{matrix.platform}}
     strategy:
       matrix:
@@ -302,15 +308,15 @@ jobs:
     #env:
     #  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: ilammy/msvc-dev-cmd@v1
       #- name: Install dependencies
       #  run: vcpkg install --triplet ${{matrix.platform}}-windows openssl pcre2 zlib
       - name: Compile and Test
         run: |
           $ErrorActionPreference = 'Stop'
-          #cmake -G "Visual Studio 17 2022" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_OPENSSL=ON -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
-          cmake -G "Visual Studio 17 2022" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
+          #cmake -G "Visual Studio 18 2026" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_OPENSSL=ON -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
+          cmake -G "Visual Studio 18 2026" -A "${{matrix.platform}}" -S "${{github.workspace}}" -B "build" -Wno-dev -DCMAKE_BUILD_TYPE=Release -DWITH_PCRE2=OFF -DWITH_PCRE=OFF -DWITH_ZLIB=OFF
           cmake --build build --config Release
           # run the compiled unit tests src/t/test_*;
           # (skip the Perl test framework in tests/*)
@@ -326,7 +332,7 @@ jobs:
         #platform: ['mingw32', 'mingw64', 'ucrt64', 'clang32', 'clang64']
     steps:
       - run: git config --global core.autocrlf input
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: msys2/setup-msys2@v2
         with:
           msystem: ${{matrix.platform}}
@@ -361,7 +367,7 @@ jobs:
       matrix:
         platform: ['x86_64']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: jirutka/setup-alpine@v1
         with:
           branch: latest-stable
@@ -369,7 +375,7 @@ jobs:
           packages: >
             build-base cmake meson ninja pkgconf perl scons
             autoconf automake libtool m4
-            gnutls-dev mbedtls-dev openssl-dev nettle-dev nss-dev wolfssl-dev
+            gnutls-dev mbedtls-dev openssl-dev nettle-dev nss-dev
             pcre2-dev brotli-dev libdeflate-dev zlib-dev zstd-dev
             cyrus-sasl-dev krb5-dev libdbi-dev linux-pam-dev openldap-dev
             mariadb-connector-c-dev postgresql16-dev
@@ -399,7 +405,7 @@ jobs:
       matrix:
         platform: ['x86','armhf','armv7','aarch64','ppc64le','riscv64','s390x']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: jirutka/setup-alpine@v1
         with:
           # riscv64 currently requires 'edge'

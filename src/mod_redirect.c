@@ -6,6 +6,7 @@
 #include "buffer.h"
 #include "burl.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "http_kv.h"    /* http_method_get_or_head() */
 
 #include "plugin.h"
@@ -21,11 +22,34 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
+INIT_FUNC(mod_redirect_init);
+FREE_FUNC(mod_redirect_free);
+SETDEFAULTS_FUNC(mod_redirect_set_defaults);
+REQUEST_FUNC(mod_redirect_uri_handler);
+
+static const plugin mod_redirect_plugin = {
+  .name                         = "redirect",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_redirect_init,
+  .cleanup                      = mod_redirect_free,
+  .set_defaults                 = mod_redirect_set_defaults,
+  .handle_uri_clean             = mod_redirect_uri_handler
+};
+
 INIT_FUNC(mod_redirect_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_redirect_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_redirect_plugin_init(plugin *p);
+int mod_redirect_plugin_init(plugin *p) {
+    memcpy(p, &mod_redirect_plugin, sizeof(plugin));
+    return 0;
 }
 
 FREE_FUNC(mod_redirect_free) {
@@ -67,12 +91,12 @@ static void mod_redirect_merge_config(plugin_config * const pconf, const config_
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_redirect_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_redirect_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_redirect_merge_config(&p->conf, p->cvlist+p->cvlist[i].v.u2[0]);
+            mod_redirect_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -157,18 +181,18 @@ SETDEFAULTS_FUNC(mod_redirect_set_defaults) {
     return HANDLER_GO_ON;
 }
 
-URIHANDLER_FUNC(mod_redirect_uri_handler) {
-    plugin_data * const p = p_d;
+REQUEST_FUNC(mod_redirect_uri_handler) {
     struct burl_parts_t burl;
     pcre_keyvalue_ctx ctx;
     handler_t rc;
 
-    mod_redirect_patch_config(r, p);
-    if (!p->conf.redirect || !p->conf.redirect->used) return HANDLER_GO_ON;
+    plugin_config pconf;
+    mod_redirect_patch_config(r, p_d, &pconf);
+    if (!pconf.redirect || !pconf.redirect->used) return HANDLER_GO_ON;
 
     ctx.cache = NULL;
-    if (p->conf.redirect->x0) { /*(p->conf.redirect->x0 is capture_idx)*/
-        ctx.cache = r->cond_match[p->conf.redirect->x0 - 1];
+    if (pconf.redirect->x0) { /*(pconf.redirect->x0 is capture_idx)*/
+        ctx.cache = r->cond_match[pconf.redirect->x0 - 1];
     }
     ctx.burl = &burl;
     burl.scheme    = &r->uri.scheme;
@@ -183,18 +207,17 @@ URIHANDLER_FUNC(mod_redirect_uri_handler) {
      * e.g. redirect /base/ to /index.php?section=base
      */
     buffer * const tb = r->tmp_buf;
-    rc = pcre_keyvalue_buffer_process(p->conf.redirect, &ctx,
+    rc = pcre_keyvalue_buffer_process(pconf.redirect, &ctx,
                                       &r->target, tb);
     if (HANDLER_FINISHED == rc) {
         http_header_response_set(r, HTTP_HEADER_LOCATION,
                                  CONST_STR_LEN("Location"),
                                  BUF_PTR_LEN(tb));
-        r->http_status = p->conf.redirect_code
-                       ? p->conf.redirect_code
+        int status = pconf.redirect_code
+                       ? pconf.redirect_code
                        : http_method_get_or_head(r->http_method)
                          || r->http_version == HTTP_VERSION_1_0 ? 301 : 308;
-        r->handler_module = NULL;
-        r->resp_body_finished = 1;
+        http_status_set_fin(r, status);
     }
     else if (HANDLER_ERROR == rc) {
         log_error(r->conf.errh, __FILE__, __LINE__,
@@ -202,20 +225,4 @@ URIHANDLER_FUNC(mod_redirect_uri_handler) {
           r->target.ptr);
     }
     return rc;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_redirect_plugin_init(plugin *p);
-int mod_redirect_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "redirect";
-
-	p->init        = mod_redirect_init;
-	p->handle_uri_clean  = mod_redirect_uri_handler;
-	p->set_defaults  = mod_redirect_set_defaults;
-	p->cleanup     = mod_redirect_free;
-
-	return 0;
 }

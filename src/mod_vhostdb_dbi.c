@@ -50,7 +50,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 /* used to reconnect to the database when we get disconnected */
@@ -163,7 +162,7 @@ static int mod_vhostdb_dbconf_setup (server *srv, const array *opts, void **vdat
 
         /* connect to database */
         mod_vhostdb_dbi_error_callback(dbconn, dbconf);
-        if (dbconf->reconnect_count >= 3) {
+        if (dbconf->reconnect_count > 3) {
             mod_vhostdb_dbconf_free(dbconf);
             return -1;
         }
@@ -172,11 +171,10 @@ static int mod_vhostdb_dbconf_setup (server *srv, const array *opts, void **vdat
     return 0;
 }
 
-static void mod_vhostdb_patch_config (request_st * const r, plugin_data * const p);
+static void mod_vhostdb_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf);
 
 static int mod_vhostdb_dbi_query(request_st * const r, void *p_d, buffer *docroot)
 {
-    plugin_data *p = (plugin_data *)p_d;
     vhostdb_config *dbconf;
     dbi_result result;
     unsigned long long nrows;
@@ -186,9 +184,10 @@ static int mod_vhostdb_dbi_query(request_st * const r, void *p_d, buffer *docroo
     buffer *sqlquery = docroot;
     buffer_clear(sqlquery); /*(also resets docroot (alias))*/
 
-    mod_vhostdb_patch_config(r, p);
-    if (NULL == p->conf.vdata) return 0; /*(after resetting docroot)*/
-    dbconf = (vhostdb_config *)p->conf.vdata;
+    plugin_config pconf;
+    mod_vhostdb_patch_config(r, p_d, &pconf);
+    if (NULL == pconf.vdata) return 0; /*(after resetting docroot)*/
+    dbconf = (vhostdb_config *)pconf.vdata;
 
     for (char *b = dbconf->sqlquery->ptr, *d; *b; b = d+1) {
         if (NULL != (d = strchr(b, '?'))) {
@@ -234,19 +233,43 @@ static int mod_vhostdb_dbi_query(request_st * const r, void *p_d, buffer *docroo
 
 
 
-INIT_FUNC(mod_vhostdb_init) {
+INIT_FUNC(mod_vhostdb_dbi_init);
+FREE_FUNC(mod_vhostdb_dbi_cleanup);
+SETDEFAULTS_FUNC(mod_vhostdb_dbi_set_defaults);
+
+static const plugin mod_vhostdb_dbi_plugin = {
+  .name                         = "vhostdb_dbi",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_vhostdb_dbi_init,
+  .cleanup                      = mod_vhostdb_dbi_cleanup,
+  .set_defaults                 = mod_vhostdb_dbi_set_defaults
+};
+
+INIT_FUNC(mod_vhostdb_dbi_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_vhostdb_dbi_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_vhostdb_backend_t http_vhostdb_backend_dbi =
       { "dbi", mod_vhostdb_dbi_query, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_vhostdb_backend_dbi */
-    http_vhostdb_backend_dbi.p_d = p;
+    http_vhostdb_backend_dbi.p_d = pd;
     http_vhostdb_backend_set(&http_vhostdb_backend_dbi);
 
-    return p;
+    return pd;
 }
 
-FREE_FUNC(mod_vhostdb_cleanup) {
+__attribute_cold__
+__declspec_dllexport__
+int mod_vhostdb_dbi_plugin_init(plugin *p);
+int mod_vhostdb_dbi_plugin_init(plugin *p) {
+    memcpy(p, &mod_vhostdb_dbi_plugin, sizeof(plugin));
+    return 0;
+}
+
+FREE_FUNC(mod_vhostdb_dbi_cleanup) {
     plugin_data * const p = p_d;
     if (NULL == p->cvlist) return;
     /* (init i to 0 if global context; to 1 to skip empty global context) */
@@ -282,16 +305,16 @@ static void mod_vhostdb_merge_config(plugin_config * const pconf, const config_p
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_vhostdb_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_vhostdb_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_vhostdb_merge_config(&p->conf,p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_vhostdb_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
-SETDEFAULTS_FUNC(mod_vhostdb_set_defaults) {
+SETDEFAULTS_FUNC(mod_vhostdb_dbi_set_defaults) {
     static const config_plugin_keys_t cpk[] = {
       { CONST_STR_LEN("vhostdb.dbi"),
         T_CONFIG_ARRAY_KVANY,
@@ -333,20 +356,4 @@ SETDEFAULTS_FUNC(mod_vhostdb_set_defaults) {
     }
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_vhostdb_dbi_plugin_init (plugin *p);
-int mod_vhostdb_dbi_plugin_init (plugin *p)
-{
-    p->version          = LIGHTTPD_VERSION_ID;
-    p->name             = "vhostdb_dbi";
-
-    p->init             = mod_vhostdb_init;
-    p->cleanup          = mod_vhostdb_cleanup;
-    p->set_defaults     = mod_vhostdb_set_defaults;
-
-    return 0;
 }

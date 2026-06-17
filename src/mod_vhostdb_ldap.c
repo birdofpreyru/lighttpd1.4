@@ -42,7 +42,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 } plugin_data;
 
 static const char *default_cafile;
@@ -389,11 +388,10 @@ static LDAPMessage * mod_authn_ldap_search(log_error_st *errh, vhostdb_config *s
     return lm;
 }
 
-static void mod_vhostdb_patch_config (request_st * const r, plugin_data * const p);
+static void mod_vhostdb_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf);
 
 static int mod_vhostdb_ldap_query(request_st * const r, void *p_d, buffer *docroot)
 {
-    plugin_data *p = (plugin_data *)p_d;
     vhostdb_config *dbconf;
     LDAP *ld;
     LDAPMessage *lm, *first;
@@ -406,9 +404,10 @@ static int mod_vhostdb_ldap_query(request_st * const r, void *p_d, buffer *docro
     buffer *filter = docroot;
     buffer_clear(filter); /*(also resets docroot (alias))*/
 
-    mod_vhostdb_patch_config(r, p);
-    if (NULL == p->conf.vdata) return 0; /*(after resetting docroot)*/
-    dbconf = (vhostdb_config *)p->conf.vdata;
+    plugin_config pconf;
+    mod_vhostdb_patch_config(r, p_d, &pconf);
+    if (NULL == pconf.vdata) return 0; /*(after resetting docroot)*/
+    dbconf = (vhostdb_config *)pconf.vdata;
     log_error_st * const errh = r->conf.errh;
     dbconf->errh = errh;
 
@@ -468,19 +467,43 @@ static int mod_vhostdb_ldap_query(request_st * const r, void *p_d, buffer *docro
 
 
 
-INIT_FUNC(mod_vhostdb_init) {
+INIT_FUNC(mod_vhostdb_ldap_init);
+FREE_FUNC(mod_vhostdb_ldap_cleanup);
+SETDEFAULTS_FUNC(mod_vhostdb_ldap_set_defaults);
+
+static const plugin mod_vhostdb_ldap_plugin = {
+  .name                         = "vhostdb_ldap",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_vhostdb_ldap_init,
+  .cleanup                      = mod_vhostdb_ldap_cleanup,
+  .set_defaults                 = mod_vhostdb_ldap_set_defaults
+};
+
+INIT_FUNC(mod_vhostdb_ldap_init) {
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_vhostdb_ldap_plugin;
+
+    /* thread-safety todo: pd unsafe for multiple, distinct lighttpd instances*/
+
     static http_vhostdb_backend_t http_vhostdb_backend_ldap =
       { "ldap", mod_vhostdb_ldap_query, NULL };
-    plugin_data *p = ck_calloc(1, sizeof(*p));
 
     /* register http_vhostdb_backend_ldap */
-    http_vhostdb_backend_ldap.p_d = p;
+    http_vhostdb_backend_ldap.p_d = pd;
     http_vhostdb_backend_set(&http_vhostdb_backend_ldap);
 
-    return p;
+    return pd;
 }
 
-FREE_FUNC(mod_vhostdb_cleanup) {
+__attribute_cold__
+__declspec_dllexport__
+int mod_vhostdb_ldap_plugin_init(plugin *p);
+int mod_vhostdb_ldap_plugin_init(plugin *p) {
+    memcpy(p, &mod_vhostdb_ldap_plugin, sizeof(plugin));
+    return 0;
+}
+
+FREE_FUNC(mod_vhostdb_ldap_cleanup) {
     plugin_data * const p = p_d;
     if (NULL == p->cvlist) return;
     /* (init i to 0 if global context; to 1 to skip empty global context) */
@@ -517,16 +540,16 @@ static void mod_vhostdb_merge_config(plugin_config * const pconf, const config_p
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_vhostdb_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_vhostdb_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_vhostdb_merge_config(&p->conf,p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_vhostdb_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
-SETDEFAULTS_FUNC(mod_vhostdb_set_defaults) {
+SETDEFAULTS_FUNC(mod_vhostdb_ldap_set_defaults) {
     static const config_plugin_keys_t cpk[] = {
       { CONST_STR_LEN("vhostdb.ldap"),
         T_CONFIG_ARRAY_KVSTRING,
@@ -580,20 +603,4 @@ SETDEFAULTS_FUNC(mod_vhostdb_set_defaults) {
     }
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_vhostdb_ldap_plugin_init (plugin *p);
-int mod_vhostdb_ldap_plugin_init (plugin *p)
-{
-    p->version          = LIGHTTPD_VERSION_ID;
-    p->name             = "vhostdb_ldap";
-
-    p->init             = mod_vhostdb_init;
-    p->cleanup          = mod_vhostdb_cleanup;
-    p->set_defaults     = mod_vhostdb_set_defaults;
-
-    return 0;
 }

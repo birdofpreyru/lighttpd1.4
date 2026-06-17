@@ -481,10 +481,10 @@ endif()
 if(WITH_MBEDTLS)
 	check_include_files(mbedtls/ssl.h HAVE_MBEDTLS_SSL_H)
 	if(HAVE_MBEDTLS_SSL_H)
-		check_library_exists(tfpsacrypto mbedtls_base64_encode "" HAVE_LIBMBEDCRYPTO)
-		if(HAVE_LIBMBEDCRYPTO)
+		check_library_exists(tfpsacrypto mbedtls_base64_encode "" HAVE_LIBTFPSACRYPTO)
+		if(HAVE_LIBTFPSACRYPTO)
 			set(CRYPTO_LIBRARY tfpsacrypto)
-			set(HAVE_LIBTFPSACRYPTO 1)
+			set(HAVE_LIBMBEDCRYPTO 1)
 			check_library_exists(mbedtls mbedtls_ssl_init "" HAVE_LIBMBEDTLS)
 			if(HAVE_LIBMBEDTLS)
 			    check_library_exists(mbedx509 mbedtls_x509_get_name "" HAVE_LIBMBEDX509)
@@ -504,7 +504,7 @@ else()
 	unset(HAVE_MBEDTLS_SSL_H)
 	unset(HAVE_LIBMBEDCRYPTO)
 	unset(HAVE_LIBMBEDTLS)
-	unset(HAVE_LIBMEDX509)
+	unset(HAVE_LIBMBEDX509)
 endif()
 
 if(WITH_NSS)
@@ -559,13 +559,19 @@ if(WITH_GNUTLS)
 endif()
 
 if(WITH_PCRE2)
-	pkg_check_modules(PCRE2 libpcre2-8)
+	find_package(PCRE2 QUIET)
 	if(PCRE2_FOUND)
-		set(PCRE_LDFLAGS "${PCRE2_LDFLAGS}")
+		set(PCRE_LDFLAGS PCRE2::8BIT)
 		set(PCRE_CFLAGS "${PCRE2_CFLAGS}")
 	else()
-		## if we have pcre2-config, use it
-		xconfig(pcre2-config PCRE_LDFLAGS PCRE_CFLAGS)
+		pkg_check_modules(PCRE2 libpcre2-8)
+		if(PCRE2_FOUND)
+			set(PCRE_LDFLAGS "${PCRE2_LDFLAGS}")
+			set(PCRE_CFLAGS "${PCRE2_CFLAGS}")
+		else()
+			## if we have pcre2-config, use it
+			xconfig(pcre2-config PCRE_LDFLAGS PCRE_CFLAGS)
+		endif()
 	endif()
 	if(PCRE_LDFLAGS OR PCRE_CFLAGS)
 		message(STATUS "found pcre2 at: LDFLAGS: ${PCRE_LDFLAGS} CFLAGS: ${PCRE_CFLAGS}")
@@ -793,7 +799,7 @@ if(WITH_LUA)
 	if(WITH_LUA_VERSION)
 		pkg_search_module(LUA REQUIRED ${WITH_LUA_VERSION})
 	else()
-		pkg_search_module(LUA REQUIRED lua54 lua5.4 lua-5.4 lua53 lua5.3 lua-5.3 lua52 lua5.2 lua-5.2 lua51 lua5.1 lua-5.1 lua)
+		pkg_search_module(LUA REQUIRED lua55 lua5.5 lua-5.5 lua54 lua5.4 lua-5.4 lua53 lua5.3 lua-5.3 lua52 lua5.2 lua-5.2 lua51 lua5.1 lua-5.1 lua)
 	endif()
 	message(STATUS "found lua at: INCDIR: ${LUA_INCLUDE_DIRS} LIBDIR: ${LUA_LIBRARY_DIRS} LDFLAGS: ${LUA_LDFLAGS} CFLAGS: ${LUA_CFLAGS}")
 	set(HAVE_LUA_H  1 "Have liblua header")
@@ -854,7 +860,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(COMMON_SRC
 	base64.c buffer.c burl.c log.c
-	http_header.c http_kv.c keyvalue.c chunk.c
+	http_header.c http_kv.c http_status.c keyvalue.c chunk.c
 	http_chunk.c fdevent.c fdevent_fdnode.c gw_backend.c
 	stat_cache.c http_etag.c array.c
 	algo_md5.c algo_sha1.c algo_splaytree.c
@@ -1056,9 +1062,11 @@ add_executable(test_common
 	t/test_base64.c
 	t/test_buffer.c
 	t/test_burl.c
+	t/test_http_cgi.c
 	t/test_http_header.c
 	t/test_http_kv.c
 	t/test_http_range.c
+	t/test_http_status.c
 	t/test_keyvalue.c
 	t/test_request.c
 	log.c
@@ -1263,7 +1271,7 @@ if(HAVE_GNUTLS)
 	target_link_libraries(mod_gnutls gnutls)
 endif()
 
-if(HAVE_LIBMBEDTLS AND HAVE_LIBMEDCRYPTO AND HAVE_LIBMEDX509)
+if(HAVE_LIBMBEDTLS AND HAVE_LIBMBEDCRYPTO AND HAVE_LIBMBEDX509)
 	add_and_install_library(mod_mbedtls "mod_mbedtls.c")
 	if(HAVE_LIBTFPSACRYPTO)
 		set(L_MOD_MBEDTLS ${L_MOD_MBEDTLS} mbedtls mbedx509 tfpsacrypto)

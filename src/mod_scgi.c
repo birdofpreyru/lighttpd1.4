@@ -13,7 +13,41 @@ typedef gw_handler_ctx   handler_ctx;
 #include "base.h"
 #include "buffer.h"
 #include "http_cgi.h"
+#include "http_status.h"
 #include "log.h"
+
+INIT_FUNC(mod_scgi_init);
+SETDEFAULTS_FUNC(mod_scgi_set_defaults);
+REQUEST_FUNC(scgi_check_extension_1);
+REQUEST_FUNC(scgi_check_extension_2);
+
+static const plugin mod_scgi_plugin = {
+  .name                         = "scgi",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_scgi_init,
+  .cleanup                      = gw_free,
+  .set_defaults                 = mod_scgi_set_defaults,
+  .handle_uri_clean             = scgi_check_extension_1,
+  .handle_subrequest_start      = scgi_check_extension_2,
+  .handle_subrequest            = gw_handle_subrequest,
+  .handle_request_reset         = gw_handle_request_reset,
+  .handle_trigger               = gw_handle_trigger,
+  .handle_waitpid               = gw_handle_waitpid_cb
+};
+
+INIT_FUNC(mod_scgi_init) {
+    plugin_data * const pd = gw_init();
+    pd->self = &mod_scgi_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_scgi_plugin_init(plugin *p);
+int mod_scgi_plugin_init(plugin *p) {
+    memcpy(p, &mod_scgi_plugin, sizeof(plugin));
+    return 0;
+}
 
 enum { LI_PROTOCOL_SCGI, LI_PROTOCOL_UWSGI };
 
@@ -52,11 +86,11 @@ static void mod_scgi_merge_config(plugin_config * const pconf, const config_plug
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_scgi_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_scgi_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_scgi_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_scgi_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -194,11 +228,9 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 	buffer_copy_string_len(b, CONST_STR_LEN("          "));
 
 	if (0 != http_cgi_headers(r, &opts, scgi_env_add, b)) {
-		r->http_status = 400;
-		r->handler_module = NULL;
 		buffer_clear(b);
 		chunkqueue_remove_finished_chunks(&hctx->wb);
-		return HANDLER_FINISHED;
+		return http_status_set_err(r, 400); /* Bad Request */
 	}
 
 	if (hctx->conf.proto == LI_PROTOCOL_SCGI) {
@@ -216,11 +248,9 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 		/* http://uwsgi-docs.readthedocs.io/en/latest/Protocol.html */
 		size_t len = buffer_clen(b)-10;
 		if (len > USHRT_MAX) {
-			r->http_status = 431; /* Request Header Fields Too Large */
-			r->handler_module = NULL;
 			buffer_clear(b);
 			chunkqueue_remove_finished_chunks(&hctx->wb);
-			return HANDLER_FINISHED;
+			return http_status_set_err(r, 431); /* Request Header Fields Too Large */
 		}
 		offset = 10 - 4;
 		b->ptr[offset]   = 0;
@@ -249,19 +279,18 @@ static handler_t scgi_create_env(handler_ctx *hctx) {
 
 
 static handler_t scgi_check_extension(request_st * const r, void *p_d, int uri_path_handler) {
-	plugin_data *p = p_d;
-	handler_t rc;
-
 	if (NULL != r->handler_module) return HANDLER_GO_ON;
 
-	mod_scgi_patch_config(r, p);
-	if (NULL == p->conf.exts) return HANDLER_GO_ON;
+	plugin_config pconf;
+	mod_scgi_patch_config(r, p_d, &pconf);
+	if (NULL == pconf.exts) return HANDLER_GO_ON;
 
-	rc = gw_check_extension(r, p, uri_path_handler, 0);
+	handler_t rc = gw_check_extension(r, &pconf, p_d, uri_path_handler, 0);
 	if (HANDLER_GO_ON != rc) return rc;
 
-	if (r->handler_module == p->self) {
-		handler_ctx *hctx = r->plugin_ctx[p->id];
+	const plugin_data_base * const pd = p_d;
+	if (r->handler_module == pd) {
+		handler_ctx *hctx = r->plugin_ctx[pd->id];
 		hctx->opts.backend = BACKEND_SCGI;
 		hctx->create_env = scgi_create_env;
 		hctx->response = chunk_buffer_acquire();
@@ -278,25 +307,4 @@ static handler_t scgi_check_extension_1(request_st * const r, void *p_d) {
 /* start request handler */
 static handler_t scgi_check_extension_2(request_st * const r, void *p_d) {
 	return scgi_check_extension(r, p_d, 0);
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_scgi_plugin_init(plugin *p);
-int mod_scgi_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name         = "scgi";
-
-	p->init         = gw_init;
-	p->cleanup      = gw_free;
-	p->set_defaults = mod_scgi_set_defaults;
-	p->handle_request_reset    = gw_handle_request_reset;
-	p->handle_uri_clean        = scgi_check_extension_1;
-	p->handle_subrequest_start = scgi_check_extension_2;
-	p->handle_subrequest       = gw_handle_subrequest;
-	p->handle_trigger          = gw_handle_trigger;
-	p->handle_waitpid          = gw_handle_waitpid_cb;
-
-	return 0;
 }

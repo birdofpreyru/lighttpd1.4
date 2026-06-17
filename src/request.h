@@ -14,6 +14,7 @@
 struct chunkqueue;      /* declaration */
 struct cond_cache_t;    /* declaration */
 struct cond_match_t;    /* declaration */
+struct plugin_data_base;/* declaration */
 struct stat_cache_entry;/* declaration */
 
 typedef struct request_config {
@@ -145,7 +146,7 @@ struct request_st {
     http_method_t http_method;
     http_version_t http_version;
 
-    const plugin *handler_module;
+    struct plugin_data_base *handler_module;
     void **plugin_ctx;           /* plugin connection specific config */
     connection *con;
 
@@ -182,6 +183,7 @@ struct request_st {
     buffer *dst_addr_buf;
 
     /* response */
+    uint32_t resp_fn_step;
     uint32_t resp_header_len;
     uint64_t resp_htags; /*bitfield of flagged headers present in response*/
     array resp_headers;
@@ -192,8 +194,7 @@ struct request_st {
     char resp_header_repeated;
 
     char loops_per_request;  /* catch endless loops in a single request */
-    int8_t keep_alive; /* only request.c can enable it, all other just disable */
-    char async_callback;
+    int8_t keep_alive; /* only request.c can enable it, others may disable */
 
     buffer *tmp_buf;                    /* shared; same as srv->tmp_buf */
     response_dechunk *gw_dechunk;

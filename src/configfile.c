@@ -140,10 +140,12 @@ static void config_merge_config_cpv(request_config * const pconf, const config_p
         pconf->range_requests = (0 != cpv->v.u);
         break;
       case 16:/* server.stream-request-body */
-        pconf->stream_request_body = cpv->v.shrt;
+        pconf->stream_request_body = cpv->v.shrt
+                                   | FDEVENT_STREAM_REQUEST_CONFIGURED;
         break;
       case 17:/* server.stream-response-body */
-        pconf->stream_response_body = cpv->v.shrt;
+        pconf->stream_response_body = cpv->v.shrt
+                                    | FDEVENT_STREAM_RESPONSE_CONFIGURED;
         break;
       case 18:/* server.kbytes-per-second */
         pconf->global_bytes_per_second = (unsigned int)((off_t *)cpv->v.v)[1];
@@ -716,7 +718,7 @@ static int config_insert_srvconf(server *srv) {
         T_CONFIG_SHORT,
         T_CONFIG_SCOPE_SERVER }
      ,{ CONST_STR_LEN("server.max-fds"),
-        T_CONFIG_SHORT,
+        T_CONFIG_INT,
         T_CONFIG_SCOPE_SERVER }
      ,{ CONST_STR_LEN("server.max-connections"),
         T_CONFIG_SHORT,
@@ -768,7 +770,8 @@ static int config_insert_srvconf(server *srv) {
         T_CONFIG_SCOPE_UNSET }
     };
 
-    srv->srvconf.h2proto = 2; /* enable HTTP/2 and h2c by default */
+    http_request_trailer_set_whitelist(NULL); /*(reset after config reload)*/
+    srv->srvconf.h2proto = 1; /* enable HTTP/2 by default */
 
     int rc = 0;
     plugin_data_base srvplug;
@@ -845,7 +848,7 @@ static int config_insert_srvconf(server *srv) {
                 srv->srvconf.max_worker = (unsigned short)cpv->v.u;
                 break;
               case 17:/* server.max-fds */
-                srv->srvconf.max_fds = (unsigned short)cpv->v.u;
+                srv->srvconf.max_fds = cpv->v.u;
                 break;
               case 18:/* server.max-connections */
                 srv->srvconf.max_conns = (unsigned short)cpv->v.u;
@@ -913,7 +916,7 @@ static int config_insert_srvconf(server *srv) {
                     srv->srvconf.h2proto +=
                       config_plugin_value_to_bool(
                         array_get_element_klen(cpv->v.a,
-                                               CONST_STR_LEN("server.h2c")), 1);
+                                               CONST_STR_LEN("server.h2c")), 0);
                 srv->srvconf.absolute_dir_redirect =
                   config_plugin_value_to_bool(
                     array_get_element_klen(cpv->v.a,
@@ -1024,6 +1027,8 @@ static void config_mimetypes_default(array * const a) {
        ,".dtd",   "application/xml-dtd"
        ,".pdf",   "application/pdf"
        ,".xhtml", "application/xhtml+xml"
+       ,".xsl",   "application/xslt+xml"
+       ,".xslt",  "application/xslt+xml"
 
        ,".eot",   "application/vnd.ms-fontobject"
        ,".otf",   "font/otf"
@@ -1036,6 +1041,7 @@ static void config_mimetypes_default(array * const a) {
        ,".conf",  "text/plain"
        ,".log",   "text/plain"
        ,".csv",   "text/csv"
+       ,".rst",   "text/x-rst"
        ,".rtf",   "text/rtf"
        ,".ics",   "text/calendar"
        ,".md",    "text/markdown;charset=utf-8"
@@ -2654,14 +2660,14 @@ int config_read(server *srv, const char *fn) {
 	config_t context;
 	data_config *dc;
 	int ret;
-	char *pos;
+	const char *pos;
 
 	context_init(srv, &context);
 	context.all_configs = srv->config_context;
 
 	pos = strrchr(fn, '/');
   #ifdef _WIN32
-	char * const spos = strrchr(fn, '\\');
+	const char * const spos = strrchr(fn, '\\');
 	if (spos > pos) pos = spos;
   #endif
 	if (pos) {

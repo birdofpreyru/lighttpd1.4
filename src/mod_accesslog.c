@@ -159,7 +159,6 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     format_fields *default_format;/* allocated if default format */
 } plugin_data;
@@ -171,8 +170,34 @@ typedef enum {
    ,BS_ESCAPE_JSON
 } buffer_bs_escape_t;
 
+INIT_FUNC(mod_accesslog_init);
+FREE_FUNC(mod_accesslog_free);
+SETDEFAULTS_FUNC(mod_accesslog_set_defaults);
+REQUEST_FUNC(log_access_write);
+TRIGGER_FUNC(log_access_periodic_flush);
+
+static const plugin mod_accesslog_plugin = {
+  .name                         = "accesslog",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_accesslog_init,
+  .cleanup                      = mod_accesslog_free,
+  .set_defaults                 = mod_accesslog_set_defaults,
+  .handle_request_done          = log_access_write,
+  .handle_trigger               = log_access_periodic_flush
+};
+
 INIT_FUNC(mod_accesslog_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_accesslog_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_accesslog_plugin_init(plugin *p);
+int mod_accesslog_plugin_init(plugin *p) {
+    memcpy(p, &mod_accesslog_plugin, sizeof(plugin));
+    return 0;
 }
 
 __attribute_cold__
@@ -340,11 +365,11 @@ static void mod_accesslog_merge_config(plugin_config * const pconf, const config
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_accesslog_patch_config(request_st * const r, plugin_data * const p) {
-    memcpy(&p->conf, &p->defaults, sizeof(plugin_config));
+static void mod_accesslog_patch_config(request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_accesslog_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_accesslog_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -998,28 +1023,28 @@ static int log_access_record (const request_st * const r, buffer * const b, form
 	return flush;
 }
 
-REQUESTDONE_FUNC(log_access_write) {
-    plugin_data * const p = p_d;
-    mod_accesslog_patch_config(r, p);
-    fdlog_st * const fdlog = p->conf.fdlog;
+REQUEST_FUNC(log_access_write) {
+    plugin_config pconf;
+    mod_accesslog_patch_config(r, p_d, &pconf);
+    fdlog_st * const fdlog = pconf.fdlog;
 
     /* No output device, nothing to do */
-    if (!p->conf.use_syslog && !fdlog) return HANDLER_GO_ON;
+    if (!pconf.use_syslog && !fdlog) return HANDLER_GO_ON;
 
-    buffer * const b = (p->conf.use_syslog || fdlog->mode == FDLOG_PIPE)
+    buffer * const b = (pconf.use_syslog || fdlog->mode == FDLOG_PIPE)
       ? (buffer_clear(r->tmp_buf), r->tmp_buf)
       : &fdlog->b;
 
-    esc_fn_t * const esc_fn = !p->conf.escaping
+    esc_fn_t * const esc_fn = !pconf.escaping
       ? buffer_append_bs_escaped
       : buffer_append_bs_escaped_json;
     const int flush =
-      log_access_record(r, b, p->conf.parsed_format, esc_fn);
+      log_access_record(r, b, pconf.parsed_format, esc_fn);
 
   #ifdef HAVE_SYSLOG_H
-    if (p->conf.use_syslog) {
+    if (pconf.use_syslog) {
         if (!buffer_is_blank(b))
-            syslog(p->conf.syslog_level, "%s", b->ptr);
+            syslog(pconf.syslog_level, "%s", b->ptr);
         return HANDLER_GO_ON;
     }
   #endif
@@ -1035,22 +1060,4 @@ REQUESTDONE_FUNC(log_access_write) {
     }
 
     return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_accesslog_plugin_init(plugin *p);
-int mod_accesslog_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "accesslog";
-
-	p->init        = mod_accesslog_init;
-	p->set_defaults= mod_accesslog_set_defaults;
-	p->cleanup     = mod_accesslog_free;
-
-	p->handle_request_done  = log_access_write;
-	p->handle_trigger       = log_access_periodic_flush;
-
-	return 0;
 }

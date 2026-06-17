@@ -226,8 +226,8 @@ typedef struct {
 
 static int ssl_is_init;
 /* need assigned p->id for deep access of module handler_ctx for connection
- *   i.e. handler_ctx *hctx = con->plugin_ctx[plugin_data_singleton->id]; */
-static plugin_data *plugin_data_singleton;
+ *   i.e. handler_ctx *hctx = con->plugin_ctx[mod_nss_plugin_data->id]; */
+static plugin_data *mod_nss_plugin_data;
 #define LOCAL_SEND_BUFSIZE 16384 /* DEFAULT_MAX_RECORD_SIZE */
 static char *local_send_buffer;
 static int feature_refresh_certs;
@@ -452,10 +452,49 @@ mod_nss_secitem_wipe (SECItem * const d)
 }
 
 
+INIT_FUNC(mod_nss_init);
+FREE_FUNC(mod_nss_free);
+SETDEFAULTS_FUNC(mod_nss_set_defaults);
+CONNECTION_FUNC(mod_nss_handle_con_accept);
+CONNECTION_FUNC(mod_nss_handle_con_shut_wr);
+CONNECTION_FUNC(mod_nss_handle_con_close);
+REQUEST_FUNC(mod_nss_handle_uri_raw);
+REQUEST_FUNC(mod_nss_handle_request_env);
+REQUEST_FUNC(mod_nss_handle_request_reset);
+TRIGGER_FUNC(mod_nss_handle_trigger);
+
+static const plugin mod_nss_plugin = {
+  .name                         = "nss",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_nss_init,
+  .cleanup                      = mod_nss_free,
+  .priv_defaults                = mod_nss_set_defaults,
+  .handle_connection_accept     = mod_nss_handle_con_accept,
+  .handle_connection_shut_wr    = mod_nss_handle_con_shut_wr,
+  .handle_connection_close      = mod_nss_handle_con_close,
+  .handle_uri_raw               = mod_nss_handle_uri_raw,
+  .handle_request_env           = mod_nss_handle_request_env,
+  .handle_request_reset         = mod_nss_handle_request_reset,
+  .handle_trigger               = mod_nss_handle_trigger
+};
+
+
 INIT_FUNC(mod_nss_init)
 {
-    plugin_data_singleton = (plugin_data *)ck_calloc(1, sizeof(plugin_data));
-    return plugin_data_singleton;
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_nss_plugin;
+    mod_nss_plugin_data = pd;
+    return pd;
+}
+
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_nss_plugin_init (plugin *p);
+int mod_nss_plugin_init (plugin *p)
+{
+    memcpy(p, &mod_nss_plugin, sizeof(plugin));
+    return 0;
 }
 
 
@@ -658,7 +697,7 @@ mod_nss_load_pem_crts (const char *fn, log_error_st *errh, CERTCertificateList *
         CERT_DestroyCertificateList(*pchain);
         *pchain = NULL;
     }
-    else if (!mod_nss_cert_is_active(cert)) {
+    else if (!mod_nss_cert_is_active(cert) && log_epoch_secs > 300) {
         log_error(errh, __FILE__, __LINE__,
           "NSS: inactive/expired X509 certificate '%s'", fn);
     }
@@ -1084,7 +1123,7 @@ mod_nss_merge_config_cpv (plugin_config * const pconf, const config_plugin_value
       case 13:/* ssl.stapling-file */
         break;
       case 14:/* debug.log-ssl-noise */
-        pconf->ssl_log_noise = (unsigned char)cpv->v.shrt;
+        pconf->ssl_log_noise = (0 != cpv->v.u);
         break;
      #if 0    /*(cpk->k_id remapped in mod_nss_set_defaults())*/
       case 15:/* ssl.verifyclient.ca-file */
@@ -1110,7 +1149,7 @@ mod_nss_merge_config(plugin_config * const pconf, const config_plugin_value_t *c
 static void
 mod_nss_patch_config (request_st * const r, plugin_config * const pconf)
 {
-    plugin_data * const p = plugin_data_singleton;
+    plugin_data * const p = mod_nss_plugin_data;
     memcpy(pconf, &p->defaults, sizeof(plugin_config));
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
@@ -1522,8 +1561,7 @@ mod_nss_alpn_select_cb (void *arg, PRFileDesc *ssl,
                   case 0:
                     if (!hctx->r->conf.h2proto) continue;
                     hctx->alpn = MOD_NSS_ALPN_H2;
-                    if (hctx->r->handler_module == NULL)/*(not mod_sockproxy)*/
-                        hctx->r->http_version = HTTP_VERSION_2;
+                    hctx->r->http_version = HTTP_VERSION_2;
                     break;
                   case 1:
                     hctx->alpn = MOD_NSS_ALPN_HTTP11;
@@ -2336,7 +2374,7 @@ mod_nss_close_notify(handler_ctx *hctx);
 static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_nss_plugin_data->id];
     PRFileDesc * const ssl = hctx->ssl;
     log_error_st * const errh = hctx->errh;
 
@@ -2412,7 +2450,7 @@ mod_nss_SSLHandshakeCallback (PRFileDesc *fd, void *arg)
 static int
 connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
-    handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
+    handler_ctx * const hctx = con->plugin_ctx[mod_nss_plugin_data->id];
 
     UNUSED(max_bytes);
 
@@ -2995,29 +3033,6 @@ TRIGGER_FUNC(mod_nss_handle_trigger) {
 }
 
 
-__attribute_cold__
-__declspec_dllexport__
-int mod_nss_plugin_init (plugin *p);
-int mod_nss_plugin_init (plugin *p)
-{
-    p->version      = LIGHTTPD_VERSION_ID;
-    p->name         = "nss";
-    p->init         = mod_nss_init;
-    p->cleanup      = mod_nss_free;
-    p->priv_defaults= mod_nss_set_defaults;
-
-    p->handle_connection_accept  = mod_nss_handle_con_accept;
-    p->handle_connection_shut_wr = mod_nss_handle_con_shut_wr;
-    p->handle_connection_close   = mod_nss_handle_con_close;
-    p->handle_uri_raw            = mod_nss_handle_uri_raw;
-    p->handle_request_env        = mod_nss_handle_request_env;
-    p->handle_request_reset      = mod_nss_handle_request_reset;
-    p->handle_trigger            = mod_nss_handle_trigger;
-
-    return 0;
-}
-
-
 static int
 mod_nss_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *curvelist)
 {
@@ -3053,8 +3068,13 @@ mod_nss_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *curv
     #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 98)
      ,{ CONST_STR_LEN("xyber768d00"), ssl_grp_kem_xyber768d00 }
     #endif
-    #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 106)
+    #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 105)
      ,{ CONST_STR_LEN("mlkem768x25519"), ssl_grp_kem_mlkem768x25519 }
+     ,{ CONST_STR_LEN("x25519mlkem768"), ssl_grp_kem_mlkem768x25519 }
+    #endif
+    #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 118)
+     ,{ CONST_STR_LEN("secp256r1mlkem768"), ssl_grp_kem_secp256r1mlkem768 }
+     ,{ CONST_STR_LEN("secp384r1mlkem1024"), ssl_grp_kem_secp384r1mlkem1024 }
     #endif
     };
 
@@ -3062,7 +3082,14 @@ mod_nss_ssl_conf_curves(server *srv, plugin_config_socket *s, const buffer *curv
     unsigned int num_grps = 0;
     const char *groups = curvelist && !buffer_is_blank(curvelist)
       ? curvelist->ptr
-      : "X25519:P-256:P-384";
+      :
+       #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 105)
+        "X25519MLKEM768:"
+       #endif
+       #if NSS_VMAJOR > 3 || (NSS_VMAJOR == 3 && NSS_VMINOR >= 118)
+        /*"SecP256r1MLKEM768:"*/
+       #endif
+        "X25519:P-256:P-384";
     for (const char *e; groups; groups = e ? e+1 : NULL) {
         e = strchr(groups, ':');
         size_t len = e ? (size_t)(e - groups) : strlen(groups);
@@ -3783,7 +3810,7 @@ static int parse_openssl_ciphers(server_rec *s, char *ciphers, PRBool cipher_lis
                                     continue;
                             }
 #if 0
-                            /* Enable the NULL ciphers only if explicity
+                            /* Enable the NULL ciphers only if explicitly
                              * requested */
                             if (ciphers_def[i].attr & SSL_eNULL) {
                                 if (mask & SSL_eNULL)

@@ -12,6 +12,7 @@
 #include "chunk.h"
 #include "http_chunk.h"
 #include "http_range.h"
+#include "http_status.h"
 
 #include "plugin.h"
 #include "plugins.h"
@@ -22,6 +23,22 @@
 
 #include <errno.h>
 #include <string.h>
+
+
+static handler_t
+http_response_prepare_handler (request_st * const r)
+{
+    plugin_data_base * const pd = r->handler_module;
+  #if 0
+    if (NULL == pd)
+        return HANDLER_GO_ON;
+  #endif
+    handler_t rc = pd->self->handle_subrequest(r, pd);
+    return rc != HANDLER_GO_ON ? rc : HANDLER_FINISHED;
+    /*(http_response_handler() handles HANDLER_GO_ON as HANDLER_FINISHED
+     * so translate to HANDLER_FINISHED so that intermediate fn ptr
+     * returns rather than continuing with next fn ptr in list)*/
+}
 
 
 static stat_cache_entry *
@@ -38,7 +55,7 @@ http_response_physical_pathinfo (request_st * const r)
         pathinfo = strchr(pathinfo+1, '/');
     /* Note: basedir might be "/" (containers) and basedir should not be empty.
      * basedir in config is allowed to end with '/', especially for basedir "/".
-     * Current implmentation below requires that pathinfo follow a regular file
+     * Current implementation below requires that pathinfo follow a regular file
      * (S_ISREG()) which is why if pathinfo matches beginning of path, pathinfo
      * is stepped to next path component.
      *   https://redmine.lighttpd.net/issues/2911
@@ -181,10 +198,10 @@ static handler_t http_response_physical_path_check(request_st * const r) {
 	 * requests and is valid only for sequential code after this func succeeds*/
 	r->tmp_sce = sce;
 
-	if (S_ISREG(sce->st.st_mode)) /*(common case)*/
-		return HANDLER_GO_ON;
-
-	if (S_ISDIR(sce->st.st_mode)) {
+	if (S_ISREG(sce->st.st_mode)) {
+		/*(common case)*/
+	}
+	else if (S_ISDIR(sce->st.st_mode)) {
 		if (!buffer_has_slash_suffix(&r->uri.path)) {
 			http_response_redirect_to_directory(r, 301);
 			return HANDLER_FINISHED;
@@ -193,23 +210,25 @@ static handler_t http_response_physical_path_check(request_st * const r) {
 		/* any special handling of other non-reg files ?*/
 	}
 
+	if (r->conf.log_request_handling) {
+		log_debug(r->conf.errh, __FILE__, __LINE__,
+		  "-- handling subrequest");
+		log_debug(r->conf.errh, __FILE__, __LINE__,
+		  "Path         : %s", r->physical.path.ptr);
+		log_debug(r->conf.errh, __FILE__, __LINE__,
+		  "URI          : %s", r->uri.path.ptr);
+		log_debug(r->conf.errh, __FILE__, __LINE__,
+		  "Pathinfo     : %.*s",
+		  BUFFER_INTLEN_PTR(&r->pathinfo));
+	}
+
 	return HANDLER_GO_ON;
 }
 
-__attribute_cold__
-__attribute_noinline__
-static handler_t http_status_set_error_close (request_st * const r, int status) {
-    r->keep_alive = 0;
-    r->resp_body_finished = 1;
-    r->handler_module = NULL;
-    r->http_status = status;
-    return HANDLER_FINISHED;
-}
 
 __attribute_cold__
 static handler_t http_response_prepare_options_star (request_st * const r) {
-    r->http_status = 200;
-    r->resp_body_finished = 1;
+    http_status_set_fin(r, 200);
     http_header_response_append(r, HTTP_HEADER_ALLOW, CONST_STR_LEN("Allow"),
                                 CONST_STR_LEN("OPTIONS, GET, HEAD, POST"));
     return HANDLER_FINISHED;
@@ -218,13 +237,16 @@ static handler_t http_response_prepare_options_star (request_st * const r) {
 
 __attribute_cold__
 static handler_t http_response_prepare_connect (request_st * const r) {
+    /*(handlers having picked up CONNECT should not then return HANDLER_GO_ON)*/
     return (r->handler_module)
-      ? HANDLER_GO_ON
-      : http_status_set_error_close(r, 405);/* 405 Method Not Allowed */
+      ? http_response_prepare_handler(r)
+      : http_status_set_err_close(r, 405); /* 405 Method Not Allowed */
 }
 
 
-static handler_t http_response_config (request_st * const r) {
+static handler_t http_response_config (request_st * const r, void *unused) {
+    UNUSED(unused);
+
     config_cond_cache_reset(r);
     config_patch_config(r);
 
@@ -247,72 +269,33 @@ static handler_t http_response_config (request_st * const r) {
         && (off_t)r->reqbody_length > ((off_t)r->conf.max_request_size << 10)) {
         log_error(r->conf.errh, __FILE__, __LINE__,
           "request-size too long: %lld -> 413", (long long) r->reqbody_length);
-        return /* 413 Payload Too Large */
-          http_status_set_error_close(r, 413);
+        return http_status_set_err_close(r, 413); /* 413 Payload Too Large */
+    }
+
+    if (r->conf.log_request_handling) {
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "-- parsed Request-URI");
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "Request-URI     : %s", r->target.ptr);
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "URI-scheme      : %s", r->uri.scheme.ptr);
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "URI-authority   : %s", r->uri.authority.ptr);
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "URI-path (clean): %s", r->uri.path.ptr);
+        log_debug(r->conf.errh, __FILE__, __LINE__,
+          "URI-query       : %.*s",
+          BUFFER_INTLEN_PTR(&r->uri.query));
     }
 
     return HANDLER_GO_ON;
 }
 
 
-__attribute_noinline__
 static handler_t
-http_response_prepare (request_st * const r)
+http_response_prepare_docroot (request_st * const r, void *unused)
 {
-    handler_t rc;
-
-	/* abort processing if error status, e.g. while parsing request hdrs */
-	if (__builtin_expect( (r->http_status > 200), 0)) { /* yes, > 200 */
-		/*(since this func no longer runs subrequest_handler,
-		 * status code check could be >= 400 for idiom where
-		 * r->http_status is set and r->handler_module is set NULL
-		 * to set up for error doc handler)*/
-		if (0 == r->resp_body_finished)
-			http_response_body_clear(r, 0);
-		return HANDLER_FINISHED;
-	}
-
-	/* initial request processing and following HANDLER_COMEBACK generally
-	 * should reprocess the request, including resetting config, but this
-	 * might be skipped after plugins have been run and path is set,
-	 * e.g. for gw_backend authorizer mode where gw_backend docroot is set
-	 * and plugin sets up handling in subrequest_handler and then returns
-	 * HANDLER_COMEBACK after auth.
-	 * (elide reprocessing request following gw_backend authorizer when
-	 *  gw_backend sets physical.path to gw_backend docroot (if set) in
-	 *  gw_authorizer_ok() before calling http_response_reset()) */
-	if (__builtin_expect( (buffer_is_unset(&r->physical.path)), 1)) {
-
-		#if 0 /*(r->async_callback currently unused)*/
-		if (__builtin_expect( (!r->async_callback), 1)) {
-		#endif
-			rc = http_response_config(r);
-			if (HANDLER_GO_ON != rc) return rc;
-		#if 0 /*(r->async_callback currently unused)*/
-		}
-		else
-			r->async_callback = 0; /* reset */
-		#endif
-
-		if (r->conf.log_request_handling) {
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "-- parsed Request-URI");
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "Request-URI     : %s", r->target.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "URI-scheme      : %s", r->uri.scheme.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "URI-authority   : %s", r->uri.authority.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "URI-path (clean): %s", r->uri.path.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "URI-query       : %.*s",
-			  BUFFER_INTLEN_PTR(&r->uri.query));
-		}
-
-
-		rc = plugins_call_handle_uri_clean(r);
-		if (HANDLER_GO_ON != rc) return rc;
+		UNUSED(unused);
 
 		if (__builtin_expect( (r->http_method == HTTP_METHOD_OPTIONS), 0)
 		    && r->uri.path.ptr[0] == '*' && r->uri.path.ptr[1] == '\0')
@@ -332,9 +315,14 @@ http_response_prepare (request_st * const r)
 		/* docroot: set r->physical.doc_root and might set r->server_name */
 		buffer_clear(&r->physical.doc_root);
 
-		rc = plugins_call_handle_docroot(r);
-		if (HANDLER_GO_ON != rc) return rc;
+		return HANDLER_GO_ON;
+}
 
+
+static handler_t
+http_response_prepare_physical (request_st * const r, void *unused)
+{
+		UNUSED(unused);
 
 		/* transform r->uri.path to r->physical.rel_path (relative file path) */
 		/* (MacOS X and Windows (typically) have case-insensitive filesystems)*/
@@ -380,9 +368,13 @@ http_response_prepare (request_st * const r)
 		                      BUF_PTR_LEN(&r->physical.doc_root),
 		                      BUF_PTR_LEN(&r->physical.rel_path));
 
-			rc = plugins_call_handle_physical(r);
-			if (HANDLER_GO_ON != rc) return rc;
+		return HANDLER_GO_ON;
+}
 
+
+static handler_t
+http_response_prepare_physical_debug (request_st * const r)
+{
 			if (r->conf.log_request_handling) {
 				log_debug(r->conf.errh, __FILE__, __LINE__,
 				  "-- logical -> physical");
@@ -395,32 +387,56 @@ http_response_prepare (request_st * const r)
 				log_debug(r->conf.errh, __FILE__, __LINE__,
 				  "Path         : %s", r->physical.path.ptr);
 			}
-	}
 
-	if (NULL != r->handler_module) return HANDLER_GO_ON;
+			return HANDLER_GO_ON;
+}
 
-		/* check if r->physical.path exists in the filesystem */
-		rc = http_response_physical_path_check(r);
-		if (HANDLER_GO_ON != rc) return rc;
 
-		if (r->conf.log_request_handling) {
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "-- handling subrequest");
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "Path         : %s", r->physical.path.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "URI          : %s", r->uri.path.ptr);
-			log_debug(r->conf.errh, __FILE__, __LINE__,
-			  "Pathinfo     : %.*s",
-			  BUFFER_INTLEN_PTR(&r->pathinfo));
-		}
+static handler_t
+http_response_prepare_subrequest_start (request_st * const r, void *unused)
+{
+    UNUSED(unused);
+  #if 0
 
-		/* request handler selection */
-		rc = plugins_call_handle_subrequest_start(r);
-		if (HANDLER_GO_ON != rc) return rc;
+    /* Note: these could be fn ptrs called directly in http_response_prepare()
+     * if the fn ptr list were to allocate slots for them and the were modified
+     * to take (and ignore) second data arg */
 
-		if (NULL != r->handler_module) return HANDLER_GO_ON;
+    handler_t rc;
 
+    rc = http_response_prepare_physical_debug(r);
+    if (HANDLER_GO_ON != rc) return rc;
+
+    /* handler for gw_authorizer might be called here (HANDLER_WAIT_FOR_EVENT)
+     * and if successful auth (later), and if gw_backend host->docroot set,
+     * then gw_backend unset r->handler_module to continue processing from this
+     * routine (repeating above funcs, too, which is ok). */
+    /* NOTE: if used in fn ptr list, http_response_prepare_handler()
+     * must be modified to check: if (NULL == pd) return HANDLER_GO_ON; */
+    if (r->handler_module)
+        rc = http_response_prepare_handler(r);
+    if (HANDLER_GO_ON != rc) return rc;
+
+    rc = http_response_physical_path_check(r);
+    if (HANDLER_GO_ON != rc) return rc;
+
+    return rc;
+
+  #else
+
+    http_response_prepare_physical_debug(r);
+    return (r->handler_module)
+      ? http_response_prepare_handler(r)
+      : http_response_physical_path_check(r);
+
+  #endif
+}
+
+
+__attribute_cold__
+static handler_t
+http_response_prepare_unhandled (request_st * const r)
+{
 			/* no handler; finish request */
 			if (__builtin_expect( (0 == r->http_status), 0)) {
 				if (r->http_method == HTTP_METHOD_OPTIONS) {
@@ -429,7 +445,7 @@ http_response_prepare (request_st * const r)
 				}
 				else if (r->http_method == HTTP_METHOD_CONNECT)
 					/* 405 Method Not Allowed */
-					return http_status_set_error_close(r, 405);
+					return http_status_set_err_close(r, 405);
 					/*return http_response_prepare_connect(r);*/
 				else if (!http_method_get_head_query_post(r->http_method))
 					r->http_status = 501;
@@ -440,10 +456,82 @@ http_response_prepare (request_st * const r)
 }
 
 
+static handler_t
+http_response_prepare_fin (request_st * const r, void *unused)
+{
+    UNUSED(unused);
+
+    /*(never return HANDLER_GO_ON by final http_response_prepare() fn ptr)*/
+    return (r->handler_module)
+      ? http_response_prepare_handler(r)
+      : http_response_prepare_unhandled(r);
+}
+
+
+/* specialized from src/plugin.c */
+typedef struct {
+  handler_t(*fn)(request_st *, void *);
+  void *data; /* plugin_data_base *data; */
+} plugin_fn_req_data;
+
+
+__attribute_hot__
+static handler_t
+http_response_prepare (request_st * const r)
+{
+    /* specialized from src/plugin.c:plugins_call_fn_req_data() */
+    /*(PLUGIN_FUNC_HANDLE_URI_CLEAN == 0 for plugin_slots[0])*/
+    const void * const plugin_slots = r->con->plugin_slots;
+    const uint32_t offset = ((const uint16_t *)plugin_slots)[0]+r->resp_fn_step;
+    const plugin_fn_req_data *plfd = (const plugin_fn_req_data *)
+      (((uintptr_t)plugin_slots) + offset);
+    /* http_response_prepare_fin() never returns HANDLER_GO_ON
+     * and will always end the for() loop, if reached in fn ptrs */
+    handler_t rc;
+    for (; (rc = plfd->fn(r, plfd->data)) == HANDLER_GO_ON; ++plfd)
+        ++r->resp_fn_step;
+    return rc;
+}
+
+
+__attribute_cold__
+void
+http_response_fn_init (server * const srv)
+{
+    /* overwrite NULL fn ptrs which were used to end hook lists
+     * (stored in linear array) so that these hooks run consecutively,
+     * along with fn ptrs inserted here.  See src/plugin.c:plugins_call_init()*/
+    /* (alternative implementation to better preserve encapsulation would be to
+     *  create an init func in response.c which passed 5 fn ptrs to an init func
+     *  in plugin.c) */
+    /*(PLUGIN_FUNC_HANDLE_URI_CLEAN == 0 for plugin_slots[0])*/
+    const void * const plugin_slots = srv->plugin_slots;
+    uint32_t offset = ((const uint16_t *)plugin_slots)[0];
+    plugin_fn_req_data *plfd = (plugin_fn_req_data *)
+      (((uintptr_t)plugin_slots) + offset);
+    plfd->fn = http_response_config;
+    do { ++plfd; } while (plfd->fn);
+    plfd->fn = http_response_prepare_docroot;
+    do { ++plfd; } while (plfd->fn);
+    plfd->fn = http_response_prepare_physical;
+    do { ++plfd; } while (plfd->fn);
+    plfd->fn = http_response_prepare_subrequest_start;
+    do { ++plfd; } while (plfd->fn);
+    plfd->fn = http_response_prepare_fin;
+}
+
+
 __attribute_cold__
 __attribute_noinline__
 static handler_t http_response_comeback (request_st * const r)
 {
+    /* initial request processing and following HANDLER_COMEBACK generally
+     * should reprocess the request, including resetting config, but this
+     * might be skipped after plugins have been run and path is set,
+     * e.g. gw_backend authorizer mode where gw_backend sets physical.path to
+     * gw_backend host->docroot (if set) in gw_authorizer_ok() before calling
+     * http_response_reset() */
+
     if (NULL != r->handler_module || !buffer_is_unset(&r->physical.path))
         return HANDLER_GO_ON;
 
@@ -456,6 +544,7 @@ static handler_t http_response_comeback (request_st * const r)
 
     int status = http_request_parse_target(r, r->con->proto_default_port);
     if (0 == status) {
+        r->resp_fn_step = 0;
         r->conditional_is_valid = (1 << COMP_SERVER_SOCKET)
                                 | (1 << COMP_HTTP_SCHEME)
                                 | (1 << COMP_HTTP_HOST)
@@ -470,7 +559,7 @@ static handler_t http_response_comeback (request_st * const r)
         r->conditional_is_valid = (1 << COMP_SERVER_SOCKET)
                                 | (1 << COMP_HTTP_REMOTE_IP);
         config_cond_cache_reset(r);
-        return http_status_set_error_close(r, status);
+        return http_status_set_err_close(r, status);
     }
 }
 
@@ -575,7 +664,7 @@ http_response_merge_trailers (request_st * const r)
   #endif
 
     /* attempt to merge trailers into headers; header not yet sent by caller */
-    if (buffer_is_blank(&r->gw_dechunk->b)) return;
+    /*if (buffer_is_blank(&r->gw_dechunk->b)) return;*//*(checked in caller)*/
     const int done = r->gw_dechunk->done;
     if (!done) return;
 
@@ -647,7 +736,7 @@ http_response_write_prepare(request_st * const r)
         break;
     }
 
-    if (r->gw_dechunk)
+    if (r->gw_dechunk && !buffer_is_blank(&r->gw_dechunk->b))
         http_response_merge_trailers(r);
 
     /* Allow filter plugins to change response headers */
@@ -659,7 +748,7 @@ http_response_write_prepare(request_st * const r)
         return HANDLER_ERROR; /*(unexpected; plugin mis-coded)*/
     }
 
-    if (r->resp_body_finished) {
+    if (r->resp_body_finished == 1) {
         /* check for Range request (current impl requires resp_body_finished) */
         if (r->conf.range_requests && r->http_status == 200
             && http_range_rfc7233(r) >= 400)
@@ -703,6 +792,10 @@ http_response_write_prepare(request_st * const r)
     else {
         /**
          * response is not yet finished, but we have all headers
+         * (or response from backend is truncated if r->resp_body_finished == 2,
+         *    and r->keep_alive = 0 should already have been set for HTTP/1.1
+         *    since final chunked block ("0\r\n\r\n") will be omitted so that
+         *    truncation can be detected by HTTP/1.1 client)
          *
          * keep-alive requires one of:
          * - Content-Length: ... (HTTP/1.1 and HTTP/1.0)
@@ -756,6 +849,23 @@ http_response_write_prepare(request_st * const r)
             }
             else { /* if (r->http_version == HTTP_VERSION_1_0) */
                 r->keep_alive = 0;
+              #if 0
+                if (r->resp_body_finished == 2) {
+                    /* For HTTP/1.0 when Content-Length has not been set, client
+                     * is unable to detect response body has been truncated */
+                    /* XXX: might provide server.feature-flags option to send
+                     *      503 Service Unavailable, or 502 Bad Gateway,
+                     *      if response is known to be truncated and actual
+                     *      Content-Length has not been set (where client could
+                     *      know that all bytes have not been received), rather
+                     *      than sending partial content as is currently done.*/
+                    /* XXX: might unset caching response headers
+                     *        ETag, Last-Modified, Cache-Control, Expires
+                     *      and/or might force
+                     *   Cache-Control: max-age=0, no-store, no-cache, private
+                     *   Expires: Thu, 01 Jan 1970 00:00:00 GMT */
+                }
+              #endif
             }
         }
     }
@@ -862,11 +972,20 @@ http_response_handler (request_st * const r)
 {
   int rc;
   do {
-    const plugin *p = r->handler_module;
-    if (NULL != p
-        || ((rc = http_response_prepare(r)) == HANDLER_GO_ON
-            && NULL != (p = r->handler_module)))
-        rc = p->handle_subrequest(r, p->data);
+    plugin_data_base * const pd = r->handler_module;
+    if (NULL != pd) /* continue response handler */
+        rc = pd->self->handle_subrequest(r, pd);
+    else if (__builtin_expect( (r->http_status > 200), 0)) { /* yes, > 200 */
+        /* cease processing if error status is set
+         * e.g. error parsing request headers or in http_response_comeback() */
+        /*(status code check could be >= 400 for idiom where r->http_status is
+         * set and r->handler_module is NULL to set up for error doc handler)*/
+        if (0 == r->resp_body_finished)
+            http_response_body_clear(r, 0);
+        rc = HANDLER_FINISHED;
+    }
+    else /* begin or continue preparing response or choosing response handler */
+        rc = http_response_prepare(r); /*(might set and call response handler)*/
 
     switch (rc) {
       case HANDLER_WAIT_FOR_EVENT:

@@ -36,6 +36,7 @@
 #include "chunk.h"
 #include "fdevent.h"
 #include "http_header.h"
+#include "http_status.h"
 #include "log.h"
 #include "sock_addr.h"
 
@@ -962,8 +963,7 @@ static gw_host * gw_host_get(request_st * const r, gw_extension *extension, int 
 
     /* all hosts are down */
     /* sorry, we don't have a server alive for this ext */
-    r->http_status = 503; /* Service Unavailable */
-    r->handler_module = NULL;
+    http_status_set_err(r, 503); /* Service Unavailable */
 
     /* only send the 'no handler' once */
     if (!extension->note_is_sent) {
@@ -1880,7 +1880,7 @@ static void gw_connection_close(gw_handler_ctx * const hctx, request_st * const 
     handler_ctx_free(hctx);
     r->plugin_ctx[p->id] = NULL;
 
-    if (r->handler_module == p->self) {
+    if (r->handler_module == (plugin_data_base *)p) {
         http_response_backend_done(r);
     }
 }
@@ -2015,6 +2015,17 @@ static handler_t gw_write_request(gw_handler_ctx * const hctx, request_st * cons
         gw_proc_load_inc(hctx->host, hctx->proc);
 
         hctx->fd = fdevent_socket_nb_cloexec(hctx->host->family,SOCK_STREAM,0);
+      #ifndef _WIN32
+        if (hctx->fd >= (int)r->con->srv->max_fds) {
+          #ifndef __COVERITY__
+            /* coverity fails to determine hctx->fd >= 0
+             * if comparison to srv->max_fds is true */
+            fdio_close_socket(hctx->fd);
+            hctx->fd = -1;
+          #endif
+            errno = EBADF;
+        }
+      #endif
         if (-1 == hctx->fd) {
             log_perror(r->conf.errh, __FILE__, __LINE__,
               "socket() failed (cur_fds:%d) (max_fds:%d)",
@@ -2374,9 +2385,7 @@ static handler_t gw_authorizer_ok(gw_handler_ctx * const hctx, request_st * cons
         log_error(r->conf.errh, __FILE__, __LINE__,
           "too many loops while processing request: %s",
           r->target_orig.ptr);
-        r->http_status = 500; /* Internal Server Error */
-        r->handler_module = NULL;
-        return HANDLER_FINISHED;
+        return http_status_set_err(r, 500); /* Internal Server Error */
     }
 
     /* restart the request so other handlers can process it */
@@ -2389,7 +2398,6 @@ static handler_t gw_authorizer_ok(gw_handler_ctx * const hctx, request_st * cons
     /*(FYI: if multiple FastCGI authorizers were to be supported,
      * next one could be started here instead of restarting request)*/
 
-    r->handler_module = NULL;
     return HANDLER_COMEBACK;
 }
 
@@ -2562,6 +2570,47 @@ int gw_upgrade_policy (request_st * const r, const int auth_mode, int upgrade)
     return upgrade;
 }
 
+int gw_incremental_policy (request_st * const r, int upgrade)
+{
+    /*(not checking auth_mode so this is run twice for authorizer,
+     * but Incremental header is checked before auth attempt)*/
+  #if 0
+    /* skip checks if in auth_mode since no request body sent to authorizer */
+    if (auth_mode)
+        return 1;
+  #endif
+
+    if (r->conf.stream_request_body & FDEVENT_STREAM_REQUEST)
+        return 1; /* already configured to stream request body */
+
+    const buffer *vb = http_header_request_get(r, HTTP_HEADER_INCREMENTAL,
+                                               CONST_STR_LEN("Incremental"));
+    if (NULL == vb || buffer_clen(vb) < 2 || 0 != memcmp(vb->ptr, "?1", 2))
+        return 1; /* not found, invalid structured-field boolean, or not true */
+
+    if ((r->conf.stream_request_body & FDEVENT_STREAM_REQUEST_CONFIGURED)
+         && !upgrade) {
+        /* if not already configured to stream request body, but configured,
+         * then policy is to fully buffer and must reject request w/ 501,
+         * though make an exception if Upgrade policy is allowed */
+      #if 0
+        log_error(r->conf.errh, __FILE__, __LINE__,
+          "Incremental request header conflicts "
+          "with server request buffering policy");
+      #endif
+        /* (use "gateway" as our proxy service name) */
+        http_header_request_append(r, HTTP_HEADER_OTHER,
+          CONST_STR_LEN("Proxy-Status"),
+          CONST_STR_LEN("gateway;error=incremental_refused"));
+        http_status_set_err(r, 501); /* Not Implemented */
+        return 0;
+    }
+    r->conf.stream_request_body |=
+      (FDEVENT_STREAM_REQUEST | FDEVENT_STREAM_REQUEST_BUFMIN);
+
+    return 1;
+}
+
 static handler_t gw_response_headers_upgrade(request_st * const r, struct http_response_opts_t *opts) {
     /* response headers just completed */
     UNUSED(r);
@@ -2579,40 +2628,38 @@ static handler_t gw_response_headers_upgrade(request_st * const r, struct http_r
     return HANDLER_GO_ON;
 }
 
-handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int uri_path_handler, size_t hctx_sz) {
+handler_t gw_check_extension(request_st * const r, gw_plugin_config * const pconf, gw_plugin_data * const p, int uri_path_handler, size_t hctx_sz) {
   #if 0 /*(caller must handle)*/
     if (NULL != r->handler_module) return HANDLER_GO_ON;
     gw_patch_connection(r, p);
-    if (NULL == p->conf.exts) return HANDLER_GO_ON;
+    if (NULL == pconf->exts) return HANDLER_GO_ON;
   #endif
 
-    buffer *fn = uri_path_handler ? &r->uri.path : &r->physical.path;
-    const size_t s_len = buffer_clen(fn);
+    const buffer *fn = uri_path_handler ? &r->uri.path : &r->physical.path;
+    if (buffer_is_blank(fn)) return HANDLER_GO_ON; /*(not expected)*/
     gw_extension *extension = NULL;
     gw_host *host = NULL;
     gw_handler_ctx *hctx;
     unsigned short gw_mode;
 
-    if (0 == s_len) return HANDLER_GO_ON; /*(not expected)*/
-
-    /* check p->conf.exts_auth list and then p->conf.ext_resp list
-     * (skip p->conf.exts_auth if array is empty
+    /* check pconf->exts_auth list and then pconf->ext_resp list
+     * (skip pconf->exts_auth if array is empty
      *  or if GW_AUTHORIZER already ran in this request) */
     hctx = r->plugin_ctx[p->id];
     /*(hctx not NULL if GW_AUTHORIZER ran; hctx->ext_auth check is redundant)*/
     gw_mode = (NULL == hctx || NULL == hctx->ext_auth)
-      ? 0              /*GW_AUTHORIZER p->conf.exts_auth will be searched next*/
-      : GW_AUTHORIZER; /*GW_RESPONDER p->conf.exts_resp will be searched next*/
+      ? 0              /*GW_AUTHORIZER pconf->exts_auth will be searched next*/
+      : GW_AUTHORIZER; /*GW_RESPONDER pconf->exts_resp will be searched next*/
 
     do {
 
         gw_exts *exts;
         if (0 == gw_mode) {
             gw_mode = GW_AUTHORIZER;
-            exts = p->conf.exts_auth;
+            exts = pconf->exts_auth;
         } else {
             gw_mode = GW_RESPONDER;
-            exts = p->conf.exts_resp;
+            exts = pconf->exts_resp;
         }
 
         if (0 == exts->used) continue;
@@ -2626,30 +2673,24 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
          * */
 
         /* check if extension-mapping matches */
-        if (p->conf.ext_mapping) {
+        if (pconf->ext_mapping) {
             data_string *ds =
-              (data_string *)array_match_key_suffix(p->conf.ext_mapping, fn);
-            if (NULL != ds) {
-                /* found a mapping */
-                    /* check if we know the extension */
-                    uint32_t k;
-                    for (k = 0; k < exts->used; ++k) {
-                        extension = exts->exts+k;
-
-                        if (buffer_is_equal(&ds->value, &extension->key)) {
-                            break;
-                        }
+              (data_string *)array_match_key_suffix(pconf->ext_mapping, fn);
+            if (NULL != ds) { /* found a mapping */
+                /* check if we know the extension */
+                for (uint32_t k = 0; k < exts->used; ++k) {
+                    gw_extension *ext = exts->exts+k;
+                    if (buffer_is_equal(&ds->value, &ext->key)) {
+                        extension = ext;
+                        break;
                     }
-
-                    if (k == exts->used) {
-                        /* found nothing */
-                        extension = NULL;
-                    }
+                }
             }
         }
 
         if (extension == NULL) {
-            size_t uri_path_len = buffer_clen(&r->uri.path);
+            const uint32_t uri_path_len = buffer_clen(&r->uri.path);
+            const uint32_t s_len = buffer_clen(fn);
 
             /* check if extension matches */
             for (uint32_t k = 0; k < exts->used; ++k) {
@@ -2657,7 +2698,7 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
               #ifdef __clang_analyzer__
                 force_assert(ext); /*(unnecessary; quiet clang analyzer)*/
               #endif
-                size_t ct_len = buffer_clen(&ext->key);
+                uint32_t ct_len = buffer_clen(&ext->key);
 
                 /* check _url_ in the form "/gw_pattern" */
                 if (ext->key.ptr[0] == '/') {
@@ -2684,7 +2725,7 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
     }
 
     /* check if we have at least one server for this extension up and running */
-    host = gw_host_get(r, extension, p->conf.balance, p->conf.debug);
+    host = gw_host_get(r, extension, pconf->balance, pconf->debug);
     if (NULL == host) {
         return HANDLER_FINISHED;
     }
@@ -2731,8 +2772,8 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
                 * PATH_INFO   = /bar
                 *
                 */
-            /* (s_len is buffer_clen(&r->uri.path) if (uri_path_handler) */
             uint32_t elen = buffer_clen(&extension->key);
+            uint32_t s_len = buffer_clen(&r->uri.path);
             const char *pathinfo;
             if (1 == elen && host->fix_root_path_name) {
                 buffer_copy_buffer(&r->pathinfo, &r->uri.path);
@@ -2749,11 +2790,13 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
     }
 
     /*(combine host upgrade setting with that of mod_proxy, mod_wstunnel)*/
-    p->conf.upgrade |= host->upgrade;
+    pconf->upgrade |= host->upgrade;
 
-    p->conf.upgrade =
-      gw_upgrade_policy(r,(gw_mode == GW_AUTHORIZER),p->conf.upgrade);
+    pconf->upgrade =
+      gw_upgrade_policy(r, (gw_mode == GW_AUTHORIZER), pconf->upgrade);
     if (0 != r->http_status)
+        return HANDLER_FINISHED;
+    if (!gw_incremental_policy(r, pconf->upgrade))
         return HANDLER_FINISHED;
 
     if (!hctx) hctx = handler_ctx_init(hctx_sz);
@@ -2772,17 +2815,17 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
         hctx->ext_auth = hctx->ext;
     }
 
-    /*hctx->conf.exts        = p->conf.exts;*/
-    /*hctx->conf.exts_auth   = p->conf.exts_auth;*/
-    /*hctx->conf.exts_resp   = p->conf.exts_resp;*/
-    /*hctx->conf.ext_mapping = p->conf.ext_mapping;*/
-    hctx->conf.balance     = p->conf.balance;
-    hctx->conf.proto       = p->conf.proto;
-    hctx->conf.debug       = p->conf.debug;
-    /*hctx->conf.upgrade     = p->conf.upgrade;*//*(use hctx->opts.upgrade)*/
+    /*hctx->conf.exts        = pconf->exts;*/
+    /*hctx->conf.exts_auth   = pconf->exts_auth;*/
+    /*hctx->conf.exts_resp   = pconf->exts_resp;*/
+    /*hctx->conf.ext_mapping = pconf->ext_mapping;*/
+    hctx->conf.balance     = pconf->balance;
+    hctx->conf.proto       = pconf->proto;
+    hctx->conf.debug       = pconf->debug;
+    /*hctx->conf.upgrade     = pconf->upgrade;*//*(use hctx->opts.upgrade)*/
 
-    if (p->conf.upgrade) {
-        hctx->opts.upgrade = p->conf.upgrade;
+    if (pconf->upgrade) {
+        hctx->opts.upgrade = pconf->upgrade;
         hctx->opts.pdata   = hctx;
         hctx->opts.headers = gw_response_headers_upgrade;
         /* if a module using gw_backend does not support upgrade, then upon
@@ -2804,7 +2847,7 @@ handler_t gw_check_extension(request_st * const r, gw_plugin_data * const p, int
 
     r->plugin_ctx[p->id] = hctx;
 
-    r->handler_module = p->self;
+    r->handler_module = (plugin_data_base *)p;
 
     if (r->conf.log_request_handling) {
         log_debug(r->conf.errh, __FILE__, __LINE__,

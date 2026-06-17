@@ -388,5 +388,14 @@ typedef struct unix_timespec64 unix_timespec64_t;
 #endif
 #endif
 
+#ifndef __attribute_packed__
+#if __has_attribute(packed) \
+ || __GNUC_PREREQ(2,95)
+#define __attribute_packed__  __attribute__((__packed__))
+#else
+#define __attribute_packed__
+#endif
+#endif
+
 
 #endif

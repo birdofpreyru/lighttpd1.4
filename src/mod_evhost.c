@@ -33,13 +33,36 @@ typedef struct {
 typedef struct {
     PLUGIN_DATA;
     plugin_config defaults;
-    plugin_config conf;
 
     array split_vals;
 } plugin_data;
 
+INIT_FUNC(mod_evhost_init);
+FREE_FUNC(mod_evhost_free);
+SETDEFAULTS_FUNC(mod_evhost_set_defaults);
+REQUEST_FUNC(mod_evhost_docroot);
+
+static const plugin mod_evhost_plugin = {
+  .name                         = "evhost",
+  .version                      = LIGHTTPD_VERSION_ID,
+  .init                         = mod_evhost_init,
+  .cleanup                      = mod_evhost_free,
+  .set_defaults                 = mod_evhost_set_defaults,
+  .handle_docroot               = mod_evhost_docroot
+};
+
 INIT_FUNC(mod_evhost_init) {
-    return ck_calloc(1, sizeof(plugin_data));
+    plugin_data * const pd = ck_calloc(1, sizeof(plugin_data));
+    pd->self = &mod_evhost_plugin;
+    return pd;
+}
+
+__attribute_cold__
+__declspec_dllexport__
+int mod_evhost_plugin_init(plugin *p);
+int mod_evhost_plugin_init(plugin *p) {
+    memcpy(p, &mod_evhost_plugin, sizeof(plugin));
+    return 0;
 }
 
 static void mod_evhost_free_path_pieces(const buffer *path_pieces) {
@@ -147,12 +170,12 @@ static void mod_evhost_merge_config(plugin_config * const pconf, const config_pl
     } while ((++cpv)->k_id != -1);
 }
 
-static void mod_evhost_patch_config(request_st * const r, plugin_data * const p) {
-    p->conf = p->defaults; /* copy small struct instead of memcpy() */
-    /*memcpy(&p->conf, &p->defaults, sizeof(plugin_config));*/
+static void mod_evhost_patch_config (request_st * const r, const plugin_data * const p, plugin_config * const pconf) {
+    *pconf = p->defaults; /* copy small struct instead of memcpy() */
+    /*memcpy(pconf, &p->defaults, sizeof(plugin_config));*/
     for (int i = 1, used = p->nconfig; i < used; ++i) {
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
-            mod_evhost_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
+            mod_evhost_merge_config(pconf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
 }
 
@@ -275,6 +298,7 @@ static void mod_evhost_parse_host(buffer *key, array *host, const buffer *author
 }
 
 static void mod_evhost_build_doc_root_path(buffer *b, array *parsed_host, const buffer *authority, const buffer *path_pieces) {
+	/* thread-safety todo: alloc parsed_host array; replace p->split_vals */
 	array_reset_data_strings(parsed_host);
 	mod_evhost_parse_host(b, parsed_host, authority);
 	buffer_clear(b);
@@ -319,13 +343,12 @@ static void mod_evhost_build_doc_root_path(buffer *b, array *parsed_host, const 
 	buffer_append_slash(b);
 }
 
-static handler_t mod_evhost_uri_handler(request_st * const r, void *p_d) {
-	plugin_data *p = p_d;
-
+static handler_t mod_evhost_docroot(request_st * const r, void *p_d) {
 	if (buffer_is_blank(&r->uri.authority)) return HANDLER_GO_ON;
 
-	mod_evhost_patch_config(r, p);
-	if (NULL == p->conf.path_pieces) return HANDLER_GO_ON;
+	plugin_config pconf;
+	mod_evhost_patch_config(r, p_d, &pconf);
+	if (NULL == pconf.path_pieces) return HANDLER_GO_ON;
 
 	if (__builtin_expect(
 	     (!(r->conf.http_parseopts & HTTP_PARSEOPT_HOST_STRICT)), 0)) {
@@ -334,7 +357,8 @@ static handler_t mod_evhost_uri_handler(request_st * const r, void *p_d) {
 	}
 
 	buffer * const b = r->tmp_buf;/*(tmp_buf cleared before use in call below)*/
-	mod_evhost_build_doc_root_path(b, &p->split_vals, &r->uri.authority, p->conf.path_pieces);
+	plugin_data *p = p_d;
+	mod_evhost_build_doc_root_path(b, &p->split_vals, &r->uri.authority, pconf.path_pieces);
 
 	if (!stat_cache_path_isdir(b)) {
 		log_perror(r->conf.errh, __FILE__, __LINE__, "%s", b->ptr);
@@ -343,19 +367,4 @@ static handler_t mod_evhost_uri_handler(request_st * const r, void *p_d) {
 	}
 
 	return HANDLER_GO_ON;
-}
-
-
-__attribute_cold__
-__declspec_dllexport__
-int mod_evhost_plugin_init(plugin *p);
-int mod_evhost_plugin_init(plugin *p) {
-	p->version     = LIGHTTPD_VERSION_ID;
-	p->name        = "evhost";
-	p->init                    = mod_evhost_init;
-	p->set_defaults            = mod_evhost_set_defaults;
-	p->handle_docroot          = mod_evhost_uri_handler;
-	p->cleanup                 = mod_evhost_free;
-
-	return 0;
 }
