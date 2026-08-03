@@ -55,6 +55,7 @@ static int burl_is_unreserved (const int c)
 }
 
 
+__attribute_cold__
 static int burl_normalize_basic_unreserved_fix (buffer *b, buffer *t, int i, int qs)
 {
     int j = i;
@@ -63,6 +64,7 @@ static int burl_normalize_basic_unreserved_fix (buffer *b, buffer *t, int i, int
     unsigned char * const p =
       (unsigned char *)buffer_string_prepare_copy(t,i+(used-i)*3+1);
     unsigned int n1, n2;
+    int invalid_utf8 = 0;
     memcpy(p, s, (size_t)i);
     for (; i < used; ++i, ++j) {
         if (!encoded_chars_http_uri_reqd[s[i]]) {
@@ -78,7 +80,7 @@ static int burl_normalize_basic_unreserved_fix (buffer *b, buffer *t, int i, int
                 p[j]   = '%';
                 p[++j] = hex_chars_uc[n1]; /*(s[i+1] & 0xdf)*/
                 p[++j] = hex_chars_uc[n2]; /*(s[i+2] & 0xdf)*/
-                if (li_utf8_invalid_byte(x)) qs = -2;
+                invalid_utf8 |= li_utf8_invalid_byte(x);
             }
             i+=2;
         }
@@ -87,11 +89,11 @@ static int burl_normalize_basic_unreserved_fix (buffer *b, buffer *t, int i, int
             p[j]   = '%';
             p[++j] = hex_chars_uc[(s[i] >> 4) & 0xF];
             p[++j] = hex_chars_uc[s[i] & 0xF];
-            if (li_utf8_invalid_byte(s[i])) qs = -2;
+            invalid_utf8 |= li_utf8_invalid_byte(s[i]);
         }
     }
     buffer_copy_string_len(b, (char *)p, (size_t)j);
-    return qs;
+    return !invalid_utf8 ? qs : -2;
 }
 
 
@@ -101,6 +103,7 @@ static int burl_normalize_basic_unreserved (buffer *b, buffer *t)
     const int used = (int)buffer_clen(b);
     unsigned int n1, n2, x;
     int qs = -1;
+    int invalid_utf8 = 0;
 
     for (int i = 0; i < used; ++i) {
         if (!encoded_chars_http_uri_reqd[s[i]]) {
@@ -108,7 +111,7 @@ static int burl_normalize_basic_unreserved (buffer *b, buffer *t)
         }
         else if (s[i]=='%' && li_cton(s[i+1], n1) && li_cton(s[i+2], n2)
                  && !burl_is_unreserved((x = (n1 << 4) | n2))) {
-            if (li_utf8_invalid_byte(x)) qs = -2;
+            invalid_utf8 |= li_utf8_invalid_byte(x);
             if (s[i+1] >= 'a') b->ptr[i+1] &= 0xdf; /* uppercase hex */
             if (s[i+2] >= 'a') b->ptr[i+2] &= 0xdf; /* uppercase hex */
             i+=2;
@@ -123,10 +126,11 @@ static int burl_normalize_basic_unreserved (buffer *b, buffer *t)
         }
     }
 
-    return qs;
+    return !invalid_utf8 ? qs : -2;
 }
 
 
+__attribute_cold__
 static int burl_normalize_basic_required_fix (buffer *b, buffer *t, int i, int qs)
 {
     int j = i;
@@ -140,7 +144,7 @@ static int burl_normalize_basic_required_fix (buffer *b, buffer *t, int i, int q
     for (; i < used; ++i, ++j) {
         if (!encoded_chars_http_uri_reqd[s[i]]) {
             p[j] = s[i];
-            if (__builtin_expect( (s[i] == '?'), 0)) qs = j;
+            if (__builtin_expect( (s[i] == '?'), 0) && -1 == qs) qs = j;
         }
         else if (s[i]=='%' && li_cton(s[i+1], n1) && li_cton(s[i+2], n2)) {
             const unsigned int x = (n1 << 4) | n2;
@@ -181,7 +185,7 @@ static int burl_normalize_basic_required (buffer *b, buffer *t)
 
     for (int i = 0; i < used; ++i) {
         if (!encoded_chars_http_uri_reqd[s[i]]) {
-            if (s[i] == '?') qs = i;
+            if (__builtin_expect( (s[i] == '?'), 0) && -1 == qs) qs = i;
         }
         else if (s[i]=='%' && li_cton(s[i+1], n1) && li_cton(s[i+2], n2)
                  && (encoded_chars_http_uri_reqd[(x = (n1 << 4) | n2)]
@@ -219,6 +223,7 @@ static int burl_contains_ctrls (const buffer *b)
 }
 
 
+__attribute_cold__
 static void burl_normalize_qs20_to_plus_fix (buffer *b, int i)
 {
     char * const s = b->ptr;
@@ -248,6 +253,7 @@ static void burl_normalize_qs20_to_plus (buffer *b, int qs)
 }
 
 
+__attribute_cold__
 static int burl_normalize_2F_to_slash_fix (buffer *b, int qs, int i)
 {
     char * const s = b->ptr;
@@ -279,8 +285,8 @@ static int burl_normalize_2F_to_slash (buffer *b, int qs, int flags)
     const int used = qs < 0 ? (int)buffer_clen(b) : qs;
     for (int i = 0; i < used; ++i) {
         if (s[i] == '%' && s[i+1] == '2' && s[i+2] == 'F') {
-            return (flags & HTTP_PARSEOPT_URL_NORMALIZE_PATH_2F_DECODE)
-              ? burl_normalize_2F_to_slash_fix(b, qs, i)
+            return !(flags & HTTP_PARSEOPT_URL_NORMALIZE_PATH_2F_REJECT)
+              ? burl_normalize_2F_to_slash_fix(b, qs, i)     /* _DECODE */
               : -2; /*(flags & HTTP_PARSEOPT_URL_NORMALIZE_PATH_2F_REJECT)*/
         }
     }
@@ -346,6 +352,11 @@ int burl_normalize (buffer *b, buffer *t, int flags)
     if (flags & HTTP_PARSEOPT_URL_NORMALIZE_PATH_BACKSLASH_TRANS) {
         for (char *p = b->ptr; *p != '?' && *p != '\0'; ++p) {
             if (*p == '\\') *p = '/';
+            if (p[0] == '%' && p[1] == '5' && (p[2] | 0x20) == 'c') {
+                p[1] = '2';
+                p[2] = 'F';
+                p += 2;
+            }
         }
     }
   #endif
